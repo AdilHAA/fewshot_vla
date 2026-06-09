@@ -1,0 +1,38 @@
+# Core DL stack
+torch>=2.0.0
+torchvision
+torchaudio
+torchcodec
+transformers
+huggingface-hub
+accelerate
+peft>=0.10.0
+wandb
+
+# lerobot — provides SmolVLAPolicy, LeRobotDataset, processors
+lerobot>=0.5.0
+draccus
+num2words  # required by the SmolVLM processor under transformers>=5
+
+# Data / utilities
+einops
+pandas
+pyarrow
+datasets
+av
+imageio
+
+# LIBERO simulator (eval-only). robosuite 1.4 is the last version compatible
+# with LIBERO; mujoco 3.x works in practice.
+robosuite==1.4.1
+mujoco
+bddl==1.0.1
+matplotlib
+cloudpickle
+gym
+easydict
+future
+# NOTE: LIBERO itself is NOT pip-installable from git (no top-level
+# libero/__init__.py → empty wheel). scripts/setup.sh clones it into
+# third_party/LIBERO and registers it via a .pth. The deps above are LIBERO's
+# runtime requirements.

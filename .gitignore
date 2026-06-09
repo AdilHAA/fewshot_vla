@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+/venv/
+/env/
+.venv/
+
+# Node
+node_modules/
+package.json
+package-lock.json
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Training artifacts (regenerated)
+wandb/
+lightning_logs/
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Datasets (downloaded from HF Hub on demand)
+/data/
+
+# Third-party source clones (installed editably; see scripts/setup.sh)
+/third_party/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

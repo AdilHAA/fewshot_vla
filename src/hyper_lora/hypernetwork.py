@@ -36,6 +36,7 @@ class HyperNetwork(nn.Module):
         vlm_vision_dim: int = 0,
         use_dino: bool = False,
         dino_dim: int = 0,
+        zero_init_up: bool = True,
     ):
         super().__init__()
         if target_modules is None:
@@ -91,6 +92,13 @@ class HyperNetwork(nn.Module):
         for mod, (in_f, out_f) in target_modules.items():
             self.heads_down[mod] = nn.Linear(hidden_size, self.lora_rank * in_f)
             self.heads_up[mod] = nn.Linear(hidden_size, out_f * self.lora_rank)
+            if zero_init_up:
+                # W_up ≡ 0 at init => ΔW = W_up·W_down = 0, so the policy starts
+                # exactly equal to the frozen base (LoRA's B=0 convention).
+                # Without this the random ΔW (scaled by alpha/rank) corrupts the
+                # ~90%-SR base at step 0 and training must first undo the damage.
+                nn.init.zeros_(self.heads_up[mod].weight)
+                nn.init.zeros_(self.heads_up[mod].bias)
 
     def forward(
         self,
@@ -191,3 +199,57 @@ class HyperNetwork(nn.Module):
         encoded = self.context_encoder(seq, src_key_padding_mask=src_key_padding_mask)
         layer_ctx = self.context_dropout(encoded[:, : self.num_layers, :])
         return self._emit_lora(layer_ctx, B)
+
+
+class StaticLoRABank(nn.Module):
+    """MT-LoRA baseline: one ordinary learnable LoRA pair per (target_module,
+    layer), shared across all tasks — no conditioning of any kind.
+
+    This is the key control for the hypernetwork: it trains on the same data,
+    through the same DynamicLoRALinear injection sites, with the same rank/alpha
+    and the same optimizer budget. Any HN gain over this baseline is attributable
+    to input-conditioning rather than to the extra adaptation training itself.
+
+    Mirrors HyperNetwork's output contract: forward(batch_size) returns
+    {mod: {layer_idx: (W_down (B, r, in), W_up (B, out, r))}} with the static
+    weights expanded (stride-0, no copy) over the batch.
+
+    Init follows standard LoRA: W_down ~ Kaiming-uniform, W_up = 0.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        lora_rank: int = 4,
+        lora_alpha: int = 16,
+        target_modules: Optional[Dict[str, Tuple[int, int]]] = None,
+    ):
+        super().__init__()
+        if target_modules is None:
+            target_modules = {"gate_proj": (960, 2560)}
+        self.num_layers = num_layers
+        self.target_modules = target_modules
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+
+        self.w_down = nn.ParameterDict()
+        self.w_up = nn.ParameterDict()
+        for mod, (in_f, out_f) in target_modules.items():
+            for layer_idx in range(num_layers):
+                key = f"{mod}_{layer_idx}"
+                w_d = torch.empty(self.lora_rank, in_f)
+                nn.init.kaiming_uniform_(w_d, a=5**0.5)
+                self.w_down[key] = nn.Parameter(w_d)
+                self.w_up[key] = nn.Parameter(torch.zeros(out_f, self.lora_rank))
+
+    def forward(self, batch_size: int) -> Dict[str, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
+        weights: Dict[str, Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = {
+            mod: {} for mod in self.target_modules
+        }
+        for mod in self.target_modules:
+            for layer_idx in range(self.num_layers):
+                key = f"{mod}_{layer_idx}"
+                w_d = self.w_down[key].unsqueeze(0).expand(batch_size, -1, -1)
+                w_u = self.w_up[key].unsqueeze(0).expand(batch_size, -1, -1)
+                weights[mod][layer_idx] = (w_d, w_u)
+        return weights

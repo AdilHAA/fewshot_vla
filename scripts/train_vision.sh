@@ -9,6 +9,12 @@
 #
 # Env vars (override as needed):
 #   STEPS      (100000)                training steps
+#   SEED       (42)                    training seed; non-default seeds get a
+#                                      suffixed OUTPUT dir automatically
+#   AUG        (0)                     1 = enable dataset image augmentations
+#                                      (color jitter etc.) during training
+#   EXPERT     (0)                     1 = also unfreeze + train the action
+#                                      expert (checkpoint grows)
 #   BATCH      (16)                    train batch size (vision+DINO are heavier
 #                                      than text-only; lower if VRAM-bound)
 #   WORKERS    (8)                     dataloader workers
@@ -29,14 +35,25 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source venv/bin/activate
 
 STEPS="${STEPS:-100000}"
+SEED="${SEED:-42}"
+AUG="${AUG:-0}"
+EXPERT="${EXPERT:-0}"
 BATCH="${BATCH:-16}"
 WORKERS="${WORKERS:-8}"
 SAVE_FREQ="${SAVE_FREQ:-25000}"
-OUTPUT="${OUTPUT:-outputs/hyper_lora_vision}"
+# Non-default seeds / ablation toggles get distinct default output dirs so
+# multi-seed and ablation runs don't collide.
+DEFAULT_OUTPUT="outputs/hyper_lora_vision"
+[ "$SEED" != "42" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_s${SEED}"
+[ "$AUG" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_aug"
+[ "$EXPERT" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_expert"
+OUTPUT="${OUTPUT:-$DEFAULT_OUTPUT}"
 PREC="${PREC:-bf16}"
 DINO_ID="${DINO_ID:-facebook/dinov2-base}"
 export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "${WANDB:-1}" = "1" ] && WANDB_FLAG=true || WANDB_FLAG=false
+[ "$AUG" = "1" ] && AUG_FLAG=true || AUG_FLAG=false
+[ "$EXPERT" = "1" ] && EXPERT_FLAG=true || EXPERT_FLAG=false
 WANDB_PROJECT="${WANDB_PROJECT:-hyper-lora-vision}"
 
 EVAL="${EVAL:-1}"
@@ -54,14 +71,16 @@ fi
 # pre-fetch every data parquet so the loader globs + filters by episode_index.
 python -c "from src.data.libero import prefetch_all_data_parquets as p; p()"
 
-echo "==> Train (vision) | vlm_vision=ON dino=ON ($DINO_ID) | prec=$PREC | batch=$BATCH | wandb=$WANDB_FLAG"
+echo "==> Train (vision) | vlm_vision=ON dino=ON ($DINO_ID) | prec=$PREC | batch=$BATCH | seed=$SEED | aug=$AUG_FLAG | expert=$EXPERT_FLAG | wandb=$WANDB_FLAG"
 python train_hyper_lora.py \
     --policy.type=hyper_lora_smolvla \
     --policy.hn_use_vlm_vision=true \
     --policy.hn_use_dino=true \
     --policy.hn_dino_model_id="$DINO_ID" \
+    --policy.train_action_expert="$EXPERT_FLAG" \
     --dataset.repo_id=lerobot/libero \
     --dataset.use_imagenet_stats=false \
+    --dataset.image_transforms.enable="$AUG_FLAG" \
     --policy.push_to_hub=false \
     --policy.device=cuda \
     --steps="$STEPS" \
@@ -69,7 +88,7 @@ python train_hyper_lora.py \
     --num_workers="$WORKERS" \
     --save_freq="$SAVE_FREQ" \
     --save_checkpoint=true \
-    --seed=42 \
+    --seed="$SEED" \
     --wandb.enable="$WANDB_FLAG" \
     --wandb.project="$WANDB_PROJECT" \
     --output_dir="$OUTPUT"

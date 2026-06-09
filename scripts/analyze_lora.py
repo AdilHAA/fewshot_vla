@@ -108,8 +108,6 @@ def main() -> None:
     print(f"{len(instructions)} task instructions")
 
     policy = HyperLoRASmolVLAPolicy.from_pretrained(args.ckpt)
-    if policy.config.static_lora:
-        raise SystemExit("static_lora checkpoint: the LoRA is constant by construction, nothing to analyze.")
     policy.to(args.device).eval()
 
     norms, fingerprints = generate_lora(policy, instructions, args.device)

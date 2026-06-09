@@ -26,7 +26,7 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 from .configuration_hyper_lora_smolvla import HyperLoRASmolVLAConfig
 from .dynamic_lora import DynamicLoRALinear
-from .hypernetwork import HyperNetwork, StaticLoRABank
+from .hypernetwork import HyperNetwork
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +42,6 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         if config.base_smolvla_path:
             self._load_base_smolvla_weights(config.base_smolvla_path)
 
-        if config.static_lora and (config.hn_use_vlm_vision or config.hn_use_dino):
-            raise ValueError(
-                "static_lora is the unconditioned MT-LoRA baseline; "
-                "hn_use_vlm_vision / hn_use_dino must be false with it."
-            )
-
         # Optional external frozen vision encoder (DINOv2), built before the
         # hypernet so its feature dim can size the projection.
         self.dino = None
@@ -57,35 +51,24 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
 
         self._patched: Dict[str, Dict[int, DynamicLoRALinear]] = {}
         target_modules = self._patch_mlp_layers(config)
-        if config.static_lora:
-            # MT-LoRA baseline: same injection sites, no conditioning. Kept under
-            # the `hypernet` attribute so freezing, checkpoint saving and
-            # trainable_parameter_count work unchanged.
-            self.hypernet = StaticLoRABank(
-                num_layers=len(self._vlm_text_model().layers),
-                lora_rank=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=target_modules,
-            )
-        else:
-            self.hypernet = HyperNetwork(
-                text_embed_dim=self._vlm_text_hidden_size(),
-                hidden_size=config.hn_hidden_size,
-                num_layers=len(self._vlm_text_model().layers),
-                lora_rank=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=target_modules,
-                dropout=config.hn_dropout,
-                encoder_type=config.hn_encoder_type,
-                tf_num_blocks=config.hn_tf_num_blocks,
-                tf_num_heads=config.hn_tf_num_heads,
-                # vision-conditioning: image tokens from the frozen VLM and/or DINO
-                use_vlm_vision=config.hn_use_vlm_vision,
-                vlm_vision_dim=self._vlm_text_hidden_size(),  # VLM image tokens live in text space
-                use_dino=config.hn_use_dino,
-                dino_dim=dino_dim,
-                zero_init_up=config.hn_zero_init_up,
-            )
+        self.hypernet = HyperNetwork(
+            text_embed_dim=self._vlm_text_hidden_size(),
+            hidden_size=config.hn_hidden_size,
+            num_layers=len(self._vlm_text_model().layers),
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            target_modules=target_modules,
+            dropout=config.hn_dropout,
+            encoder_type=config.hn_encoder_type,
+            tf_num_blocks=config.hn_tf_num_blocks,
+            tf_num_heads=config.hn_tf_num_heads,
+            # vision-conditioning: image tokens from the frozen VLM and/or DINO
+            use_vlm_vision=config.hn_use_vlm_vision,
+            vlm_vision_dim=self._vlm_text_hidden_size(),  # VLM image tokens live in text space
+            use_dino=config.hn_use_dino,
+            dino_dim=dino_dim,
+            zero_init_up=config.hn_zero_init_up,
+        )
         self._freeze_base()
 
     def _load_base_smolvla_weights(self, path: str) -> None:
@@ -217,12 +200,6 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
 
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
-        if self.config.static_lora:
-            # Unconditioned baseline: no context to encode, just expand the
-            # static LoRA bank over the batch.
-            self._set_lora_weights(self.hypernet(lang_tokens.shape[0]))
-            return
-
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         with torch.set_grad_enabled(self.training):
             text_embeds = self._embed_language(lang_tokens)

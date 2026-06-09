@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Eval matrix: policies × suites × seeds, with a summary table at the end.
+# Eval: policies × suites × seeds, with a summary table at the end. A single
+# policy/suite/seed is just a 1×1×1 matrix.
 # Resumable — a cell whose eval_info.json already exists is skipped, so the
 # script can be re-run after an interruption (or extended with more
 # seeds/suites) and only computes what's missing.
 #
-#   bash scripts/eval_matrix.sh
-#   POLICIES="text=outputs/hyper_lora_text/checkpoints/last/pretrained_model" bash scripts/eval_matrix.sh
-#   TASKS="libero_spatial libero_spatial_object" SEEDS="1000" bash scripts/eval_matrix.sh
+#   bash scripts/eval.sh
+#   POLICIES="lora=outputs/lora_baseline/checkpoints/last/pretrained_model" bash scripts/eval.sh
+#   TASKS="libero_spatial libero_spatial_object" SEEDS="1000" bash scripts/eval.sh
 #
 # Env vars:
 #   POLICIES  (base + vision)     space-separated label=policy.path pairs
@@ -44,7 +45,8 @@ fi
 for entry in $POLICIES; do
     label="${entry%%=*}"
     path="${entry#*=}"
-    if [ "$path" != "${path#outputs/}" ] && [ ! -f "$path/model.safetensors" ]; then
+    if [ "$path" != "${path#outputs/}" ] \
+        && [ ! -f "$path/model.safetensors" ] && [ ! -f "$path/adapter_model.safetensors" ]; then
         echo "ERROR: [$label] checkpoint not found at $path" >&2
         exit 1
     fi

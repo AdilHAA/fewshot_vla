@@ -42,13 +42,6 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     # False reproduces the legacy behavior (random ΔW injected at init).
     hn_zero_init_up: bool = True
 
-    # MT-LoRA baseline: replace the hypernetwork with a single static learnable
-    # LoRA per (module, layer) — same data / sites / rank / alpha, no
-    # conditioning. The control that separates "conditioning helps" from
-    # "any extra adaptation training helps". Mutually exclusive with the
-    # hn_use_* vision flags.
-    static_lora: bool = False
-
     # --- Vision-conditioning for the hypernetwork --------------------------------
     # Off by default => the hypernetwork is conditioned on text only. Toggle these
     # to also condition LoRA generation on visual context:

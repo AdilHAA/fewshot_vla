@@ -5,15 +5,15 @@
 # (training + LIBERO/LIBERO-Pro eval) with no further manual steps.
 #
 # Idempotent: safe to re-run. Repairs a broken/foreign pre-existing venv,
-# installs deps, patches upstream lerobot, initializes the LIBERO config
-# non-interactively, and verifies torch+CUDA / lerobot / libero / mujoco.
+# installs deps via `uv` (fast, isolated), patches upstream lerobot,
+# initializes the LIBERO config non-interactively, and verifies torch+CUDA.
 #
 # Usage:
 #     bash scripts/setup.sh
 #
 # Env vars:
-#     PYTHON_BIN       (default: python3)             Python interpreter to use
-#     VENV_DIR         (default: venv)                Where to create the venv
+#     PYTHON_VERSION   (default: 3.12)              Target Python version (uv will download if missing)
+#     VENV_DIR         (default: venv)               Where to create the venv
 #     PREFETCH_MODELS  (default: 0; set 1 to enable)  Download base + VLM (~3GB)
 #     PREFETCH_DATA    (default: 0; set 1 to enable)  Download lerobot/libero (~2GB)
 #     PREFETCH         (default: unset)               'all' = both flags above
@@ -22,57 +22,66 @@
 
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+# Для обратной совместимости: если передали старый PYTHON_BIN, используем его,
+# но по умолчанию жестко требуем 3.12 (или любую 3.12+).
+PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 VENV_DIR="${VENV_DIR:-venv}"
 REQ_FILE="${REQ_FILE:-requirements.txt}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# 0. Ensure 'uv' is available (installs locally to ~/.local/bin if missing)
+if ! command -v uv &> /dev/null; then
+    echo "==> 'uv' not found. Installing it locally to ~/.local/bin..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
 echo "==> Repo:    $REPO_ROOT"
-echo "==> Python:  $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
+echo "==> Python:  $PYTHON_VERSION (managed by uv)"
 echo "==> Venv:    $VENV_DIR"
 
-# 1. Python version check (lerobot needs >= 3.10)
-if ! "$PYTHON_BIN" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"; then
-    echo "ERROR: Python 3.10+ is required (lerobot dependency)."
+if ! [[ "$PYTHON_VERSION" =~ ^3\.(1[0-9]|[2-9][0-9])$ ]]; then
+    echo "ERROR: PYTHON_VERSION must be 3.10+ (e.g., '3.12'). Got: $PYTHON_VERSION"
     exit 1
 fi
 
-# 2. Create venv if missing; repair if a pre-existing one is broken.
-#    (A venv copied/moved between machines can have a dangling interpreter
-#    symlink — `bin/python` points at a base prefix that no longer exists.)
-venv_ok() { [ -x "$VENV_DIR/bin/python" ] && "$VENV_DIR/bin/python" -c "import sys" >/dev/null 2>&1; }
-
-if [ -d "$VENV_DIR" ] && ! venv_ok; then
-    echo "==> Existing venv at $VENV_DIR is broken (dead interpreter); recreating"
-    rm -rf "$VENV_DIR"
+if [ -d "$VENV_DIR" ]; then
+    CURRENT_VER="$("$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo 'none')"
+    if [ "$CURRENT_VER" != "$PYTHON_VERSION" ]; then
+        echo "==> Existing venv has Python $CURRENT_VER (need $PYTHON_VERSION); recreating"
+        rm -rf "$VENV_DIR"
+    fi
 fi
+
 if [ ! -d "$VENV_DIR" ]; then
-    echo "==> Creating virtualenv at $VENV_DIR"
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
+    echo "==> Creating virtualenv at $VENV_DIR (uv will auto-download Python $PYTHON_VERSION if needed)"
+    # Команда ниже скачает нужный Python в ~/.local/share/uv/python и создаст venv
+    uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
 fi
 
-# shellcheck disable=SC1090,SC1091
+
 source "$VENV_DIR/bin/activate"
 
-if ! venv_ok; then
+
+if ! "$VENV_DIR/bin/python" -c "import sys" >/dev/null 2>&1; then
     echo "ERROR: venv interpreter still not usable after (re)creation: $VENV_DIR"
     exit 1
 fi
 
-# 3. Upgrade pip + install requirements
-pip install --upgrade pip setuptools wheel
+echo "==> Active Python: $(python --version 2>&1)"
+
 
 if [ "${SKIP_SIM:-0}" = "1" ]; then
-    echo "==> Installing training-only deps (skipping LIBERO simulator)"
-    # Strip LIBERO sim block (everything after the matching comment header)
+    echo "==> Installing training-only deps (skipping LIBERO simulator) via uv pip"
     TMP_REQ="$(mktemp)"
     awk '/^# LIBERO simulator/ {exit} {print}' "$REQ_FILE" > "$TMP_REQ"
-    pip install -r "$TMP_REQ"
+    uv pip install -r "$TMP_REQ"
     rm -f "$TMP_REQ"
 else
-    pip install -r "$REQ_FILE"
+    echo "==> Installing all deps via uv pip"
+    uv pip install -r "$REQ_FILE"
 fi
 
 # 3b. Patch upstream lerobot incompatibilities (idempotent).

@@ -7,10 +7,11 @@
 #   bash scripts/train.sh                       # vision-conditioned hypernet
 #   MODE=text bash scripts/train.sh             # text-only hypernet (ablation)
 #   MODE=lora bash scripts/train.sh             # stock PEFT LoRA, same sites
+#   MODE=traj bash scripts/train.sh             # trajectory-conditioned hypernet
 #   RESUME=1 bash scripts/train.sh              # resume OUTPUT from last ckpt
 #
 # Env vars:
-#   MODE       (vision)               vision | text | lora
+#   MODE       (vision)               vision | text | lora | traj
 #   RESUME     (0)                    1 = resume $OUTPUT from its last checkpoint
 #   STEPS      (100000)               training steps
 #   SEED       (42)                   training seed; non-default seeds get a
@@ -25,6 +26,10 @@
 #   OUTPUT     (outputs/<mode>…)      output dir (must not pre-exist unless RESUME=1)
 #   PREC       (bf16)                 bf16 | no (fp32)
 #   DINO_ID    (facebook/dinov2-base) external vision encoder (vision mode)
+#   XPAIR_CACHE (outputs/xpair_cache/dino)  traj-clip cache dir (traj mode; build
+#                                     it first with scripts/build_xpair_cache.py)
+#   KV         (0)                    1 = also inject LoRA at the VLM k/v routing
+#                                     site (traj mode)
 #   WANDB      (1)                    1 = enable wandb logging
 #   WANDB_PROJECT (hyper-lora)        wandb project name
 
@@ -44,6 +49,9 @@ WORKERS="${WORKERS:-8}"
 SAVE_FREQ="${SAVE_FREQ:-25000}"
 PREC="${PREC:-bf16}"
 DINO_ID="${DINO_ID:-facebook/dinov2-base}"
+XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/dino}"
+KV="${KV:-0}"
+[ "$KV" = "1" ] && KV_FLAG=true || KV_FLAG=false
 export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "${WANDB:-1}" = "1" ] && WANDB_FLAG=true || WANDB_FLAG=false
 [ "$AUG" = "1" ] && AUG_FLAG=true || AUG_FLAG=false
@@ -54,13 +62,15 @@ case "$MODE" in
     vision) DEFAULT_OUTPUT="outputs/hyper_lora_vision"; BATCH="${BATCH:-16}" ;;
     text)   DEFAULT_OUTPUT="outputs/hyper_lora_text";   BATCH="${BATCH:-32}" ;;
     lora)   DEFAULT_OUTPUT="outputs/lora_baseline";     BATCH="${BATCH:-32}" ;;
-    *) echo "ERROR: MODE must be vision | text | lora, got '$MODE'" >&2; exit 1 ;;
+    traj)   DEFAULT_OUTPUT="outputs/hyper_lora_traj";   BATCH="${BATCH:-32}" ;;
+    *) echo "ERROR: MODE must be vision | text | lora | traj, got '$MODE'" >&2; exit 1 ;;
 esac
 # Ablation toggles get distinct default output dirs so runs don't collide.
 [ "$RANK" != "4" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_r${RANK}"
 [ "$SEED" != "42" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_s${SEED}"
 [ "$AUG" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_aug"
 [ "$EXPERT" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_expert"
+[ "$MODE" = "traj" ] && [ "$KV" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_kv"
 OUTPUT="${OUTPUT:-$DEFAULT_OUTPUT}"
 
 if [ "$RESUME" = "1" ]; then
@@ -110,6 +120,23 @@ case "$MODE" in
             --policy.path=HuggingFaceVLA/smolvla_libero
             --peft.r="$RANK"
             --peft.target_modules='model\.vlm_with_expert\.vlm\.model\.text_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)'
+        ) ;;
+    traj)
+        # Trajectory-conditioned hypernet: the HN reads a demo clip from the
+        # offline cache. Build it first with scripts/build_xpair_cache.py.
+        if [ ! -d "$XPAIR_CACHE" ]; then
+            echo "ERROR: traj cache '$XPAIR_CACHE' not found — build it first:" >&2
+            echo "       python scripts/build_xpair_cache.py --out $XPAIR_CACHE ..." >&2
+            exit 1
+        fi
+        MODE_ARGS+=(
+            --policy.type=traj_hyper_lora_smolvla
+            --policy.hn_use_traj_clip=true
+            --policy.hn_xpair_cache_path="$XPAIR_CACHE"
+            --policy.hn_traj_encoder=dino
+            --policy.hn_inject_vlm_kv="$KV_FLAG"
+            --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
+            --policy.train_action_expert="$EXPERT_FLAG"
         ) ;;
 esac
 

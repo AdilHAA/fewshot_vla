@@ -16,6 +16,8 @@
 #   EPISODES  (50)                episodes per task (BATCH must divide it)
 #   BATCH     (2)                 parallel envs per task (24GB -> 2)
 #   OUT_ROOT  (outputs/eval_matrix)  root dir for all cells
+#   TRAJ_SOURCE ()                   traj policy eval mode: self | retrieval |
+#                                    one_shot (empty = leave the policy default)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -32,6 +34,8 @@ SEEDS="${SEEDS:-1000 2000 3000}"
 EPISODES="${EPISODES:-50}"
 BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
+TRAJ_SOURCE="${TRAJ_SOURCE:-}"
+[ -n "$TRAJ_SOURCE" ] && TRAJ_ARGS=(--policy.hn_traj_source="$TRAJ_SOURCE") || TRAJ_ARGS=()
 
 # Guard: refuse to start if the GPU is already busy (avoids two-process OOM).
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -62,6 +66,7 @@ for entry in $POLICIES; do
             echo "==> eval [$label | $task | seed=$seed] | episodes=$EPISODES | batch=$BATCH"
             python eval_hyper_lora.py \
                 --policy.path="$path" \
+                "${TRAJ_ARGS[@]}" \
                 --env.type=libero --env.task="$task" \
                 --eval.n_episodes="$EPISODES" --eval.batch_size="$BATCH" \
                 --seed="$seed" \

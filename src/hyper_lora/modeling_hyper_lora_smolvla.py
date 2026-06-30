@@ -8,6 +8,7 @@ Each forward generates per-sample LoRA from the instruction and injects it.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -70,6 +71,67 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
             zero_init_up=config.hn_zero_init_up,
         )
         self._freeze_base()
+        self._lora_cache = None
+        self._prev_lora_flat = None
+        self._lora_step = 0
+        self._prev_action = None
+        self._act_step = 0
+
+    def reset(self):
+        super().reset()
+        self._lora_cache = None
+        self._prev_lora_flat = None
+        self._lora_step = 0
+        self._prev_action = None
+        self._act_step = 0
+
+    @torch.no_grad()
+    def select_action(self, batch, *args, **kwargs):
+        a = super().select_action(batch, *args, **kwargs)
+        if os.environ.get("HN_LOG_ACTION"):
+            self._log_action(a)
+        return a
+
+    def _log_action(self, a: Tensor) -> None:
+        # Norm, jerk, and max-abs: cheap behavioral probe for divergence/jitter.
+        x = a.detach().float()
+        flat = x.reshape(x.shape[0], -1) if x.ndim > 1 else x.reshape(1, -1)
+        prev = self._prev_action
+        jerk = (
+            (flat - prev).norm(dim=-1).mean().item()
+            if prev is not None and prev.shape == flat.shape
+            else float("nan")
+        )
+        self._prev_action = flat
+        self._act_step += 1
+        logger.warning(
+            "[ACT] step=%d a_norm=%.4f jerk=%.4f amax=%.4f",
+            self._act_step, flat.norm(dim=-1).mean().item(), jerk, x.abs().max().item(),
+        )
+
+    def _lora_cache_mode(self) -> str:
+        # Env var wins over config; never cache during training.
+        env = os.environ.get("HN_LORA_CACHE")
+        if env:
+            return env.strip().lower()
+        return "episode" if getattr(self.config, "hn_lora_cache_eval", False) else "off"
+
+    def _log_lora_drift(self, weights) -> None:
+        # L2 norm of all generated LoRA params and step-to-step delta. HN_LOG_LORA=1.
+        flat = torch.cat(
+            [t.reshape(-1) for layers in weights.values() for pair in layers.values() for t in pair]
+        ).float()
+        prev = self._prev_lora_flat
+        drift = (
+            (flat - prev).norm().item()
+            if prev is not None and prev.numel() == flat.numel()
+            else float("nan")
+        )
+        self._prev_lora_flat = flat.detach()
+        self._lora_step += 1
+        logger.warning(
+            "[HN] step=%d lora_norm=%.4f step_drift=%.4f", self._lora_step, flat.norm().item(), drift
+        )
 
     def _load_base_smolvla_weights(self, path: str) -> None:
         base = SmolVLAPolicy.from_pretrained(path)
@@ -199,6 +261,13 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         return self.model.vlm_with_expert.embed_language_tokens(lang_tokens)
 
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:
+        # At eval, optionally reuse a per-episode adapter to break the
+        # vision-conditioned feedback loop (see config.hn_lora_cache_eval).
+        cache_episode = (not self.training) and self._lora_cache_mode() == "episode"
+        if cache_episode and self._lora_cache is not None:
+            self._set_lora_weights(self._lora_cache)
+            return
+
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         with torch.set_grad_enabled(self.training):
@@ -217,7 +286,11 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         weights = self.hypernet(
             text_embeds, lang_masks, vlm_vision_embeds, dino_embeds
         )
+        if os.environ.get("HN_LOG_LORA"):
+            self._log_lora_drift(weights)
         self._set_lora_weights(weights)
+        if cache_episode:
+            self._lora_cache = weights
 
     def _set_lora_weights(
         self, weights: Dict[str, Dict[int, Tuple[Tensor, Tensor]]]

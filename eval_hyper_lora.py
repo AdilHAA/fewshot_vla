@@ -16,6 +16,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", "0")
 
 import src.hyper_lora  # noqa: E402,F401 — registers HyperLoRASmolVLAPolicy
+import src.hyper_lora_traj  # noqa: E402,F401 — registers TrajHyperLoRASmolVLAPolicy
 import src.libero_pro  # noqa: E402,F401 — registers LIBERO-Pro perturbed suites
 from lerobot.scripts.lerobot_eval import eval_main  # noqa: E402
 

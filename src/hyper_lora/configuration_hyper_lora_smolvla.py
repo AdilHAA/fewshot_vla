@@ -51,3 +51,7 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     hn_use_vlm_vision: bool = False  # condition HN on the frozen VLM's own image tokens
     hn_use_dino: bool = False        # additionally condition on a frozen external DINOv2
     hn_dino_model_id: str = "facebook/dinov2-base"
+
+    # Cache the generated adapter once per episode at eval time; breaks the
+    # vision-feedback loop. HN_LORA_CACHE={off,episode} overrides at runtime.
+    hn_lora_cache_eval: bool = False

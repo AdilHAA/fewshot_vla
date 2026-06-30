@@ -21,6 +21,7 @@ state_dict. Explicit CLI flags win; resuming a checkpoint skips injection.
 import sys
 
 import src.hyper_lora  # noqa: F401 — registers the hyper_lora_smolvla policy type
+import src.hyper_lora_traj  # noqa: F401 — registers the traj_hyper_lora_smolvla policy type
 from src.hyper_lora import HyperLoRASmolVLAConfig
 from src.hyper_lora.base_config import base_config_overrides
 from lerobot.scripts.lerobot_train import main
@@ -28,7 +29,12 @@ from lerobot.scripts.lerobot_train import main
 
 def _inject_base_config_overrides() -> None:
     argv = sys.argv[1:]
-    if "--policy.type=hyper_lora_smolvla" not in argv:
+    # Both policy types load the same frozen base, so both need the narrow-expert
+    # SmolVLA config overrides derived from the base checkpoint.
+    if not any(
+        f"--policy.type={t}" in argv
+        for t in ("hyper_lora_smolvla", "traj_hyper_lora_smolvla")
+    ):
         return
     if any(a.startswith("--policy.path=") for a in argv):
         return  # resuming our own checkpoint: its config.json is authoritative

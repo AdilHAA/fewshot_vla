@@ -253,6 +253,8 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         return super().select_action(batch, *args, **kwargs)
 
     def reset(self):
+        # SmolVLAPolicy.__init__ calls reset() before our __init__ sets _frame_buf.
         super().reset()
-        if self._frame_buf is not None:
-            self._frame_buf.reset()
+        fb = getattr(self, "_frame_buf", None)
+        if fb is not None:
+            fb.reset()

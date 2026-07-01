@@ -68,9 +68,20 @@ def _load_episodes(repo_id, revision, num_frames, stride):  # pragma: no cover (
     prefetch_all_data_parquets(repo_id, revision)          # work around wrong file_index
     ds = LeRobotDataset(repo_id, revision=revision)
     img_key = ds.meta.camera_keys[0]                       # main camera
-    frm, to = ds.episode_data_index["from"], ds.episode_data_index["to"]
+    eps = ds.meta.episodes                                 # v3.0: dataset_from/to_index cols
+
+    def _erow(i):
+        return eps.iloc[i].to_dict() if hasattr(eps, "iloc") else eps[i]
+
+    acc = 0
     for ep in range(ds.meta.total_episodes):
-        start, length = int(frm[ep]), int(to[ep]) - int(frm[ep])
+        row = _erow(ep)
+        if row.get("dataset_from_index") is not None:
+            start = int(row["dataset_from_index"])
+            length = int(row["dataset_to_index"]) - start
+        else:                                              # fall back to cumulative length
+            start, length = acc, int(row["length"])
+            acc += length
         local = opening_clip_indices(length, num_frames, stride)
         frames = torch.stack([ds[start + i][img_key] for i in local])  # (T,C,H,W) in [0,1]
         first = ds[start]

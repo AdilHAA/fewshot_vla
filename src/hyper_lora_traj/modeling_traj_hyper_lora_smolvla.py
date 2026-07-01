@@ -18,7 +18,7 @@ from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TO
 
 from src.hyper_lora.dynamic_lora import DynamicLoRALinear
 from src.hyper_lora.modeling_hyper_lora_smolvla import HyperLoRASmolVLAPolicy
-from src.traj_data.encoder import dino_encode, imagenet_buffers
+from src.traj_data.encoder import build_traj_encoder
 from src.traj_data.xpair_select import select_eval_conditioning, select_train_conditioning
 
 from .configuration_traj_hyper_lora_smolvla import TrajHyperLoRASmolVLAConfig
@@ -43,7 +43,8 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             from src.traj_data.traj_cache import TrajCache
 
             self._traj_cache = TrajCache(config.hn_xpair_cache_path)
-            self._traj_cache.assert_header_matches(num_frames=config.hn_traj_num_frames)
+            self._traj_cache.assert_header_matches(
+                num_frames=config.hn_traj_num_frames, encoder_id=config.hn_traj_encoder)
             traj_dim = int(self._traj_cache.header["d_enc"])
 
         # Replace the plain HyperNetwork with FusionHyperNetwork over the same
@@ -82,9 +83,8 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         self._traj_gen = torch.Generator().manual_seed(int(config.hn_seed))
         # Eval-only live conditioning, built lazily on first eval use.
         self._frame_buf = None
-        self._traj_dino = None
-        self._traj_mean = None
-        self._traj_std = None
+        self._traj_encoder = None
+        self._traj_encode = None
         self._sent_enc = None
         if config.hn_use_traj_clip:
             from src.traj_data.frame_buffer import FrameBuffer
@@ -176,19 +176,14 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
 
     # --- eval live conditioning ------------------------------------------------------
     def _ensure_eval_encoders(self) -> None:
-        """Lazily build frozen DINOv2 (live clip encode) + sentence encoder (retrieval
-        text key). Built on first eval use so training never pays for them."""
-        if self._traj_dino is None and self.config.hn_traj_encoder == "dino":
-            if getattr(self, "dino", None) is not None:
-                self._traj_dino = self.dino  # reuse conditioning DINOv2 if present
-            else:
-                from transformers import AutoModel
-
-                self._traj_dino = AutoModel.from_pretrained(self.config.hn_dino_model_id).eval()
-                for p in self._traj_dino.parameters():
-                    p.requires_grad = False
-            dev = next(self._traj_dino.parameters()).device
-            self._traj_mean, self._traj_std = imagenet_buffers(dev, torch.float32)
+        """Lazily build the frozen clip encoder (dino/vjepa2) + sentence encoder for
+        retrieval, on first eval use so training never pays for them."""
+        if self._traj_encode is None:
+            model_id = (self.config.hn_dino_model_id if self.config.hn_traj_encoder == "dino"
+                        else self.config.hn_vjepa_model_id)
+            dev = next(self.parameters()).device
+            self._traj_encoder, self._traj_encode = build_traj_encoder(
+                self.config.hn_traj_encoder, model_id, dev)
         if self._sent_enc is None and self.config.hn_traj_source == "retrieval":
             from sentence_transformers import SentenceTransformer
 
@@ -199,9 +194,9 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
 
     def _build_eval_conditioning(self, batch: Dict[str, Tensor]):
         self._ensure_eval_encoders()
-        dev = next(self._traj_dino.parameters()).device
+        dev = next(self._traj_encoder.parameters()).device
         clip = self._frame_buf.clip().to(dev)  # (T,C,H,W) in [0,1]
-        traj_q = dino_encode(self._traj_dino, self._traj_mean, self._traj_std, clip.unsqueeze(0))
+        traj_q = self._traj_encode(clip.unsqueeze(0))
         source = getattr(self.config, "hn_traj_source", "self")
         if source == "self":
             return traj_q.to(self._hypernet_device()), None

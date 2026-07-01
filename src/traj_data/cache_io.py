@@ -18,6 +18,7 @@ class CacheHeader:
     jitter: str
     d_enc: int
     ntok: int
+    n_tokens: int          # total tokens per clip (dino: T*ntok; vjepa2: spatiotemporal)
     sentence_encoder_id: str
     beta_t: float
     beta_f: float

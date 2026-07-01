@@ -26,8 +26,11 @@
 #   OUTPUT     (outputs/<mode>…)      output dir (must not pre-exist unless RESUME=1)
 #   PREC       (bf16)                 bf16 | no (fp32)
 #   DINO_ID    (facebook/dinov2-base) external vision encoder (vision mode)
-#   XPAIR_CACHE (outputs/xpair_cache/dino)  traj-clip cache dir (traj mode; build
-#                                     it first with scripts/build_xpair_cache.py)
+#   ENC        (dino)                traj clip encoder: dino | vjepa2
+#   FRAMES     (4)                   traj clip length (vjepa2: use 16, even)
+#   XPAIR_CACHE (outputs/xpair_cache/$ENC)  traj-clip cache dir (traj mode; build
+#                                     it first with scripts/build_xpair_cache.py
+#                                     --encoder $ENC --num_frames $FRAMES)
 #   KV         (0)                    1 = also inject LoRA at the VLM k/v routing
 #                                     site (traj mode)
 #   WANDB      (1)                    1 = enable wandb logging
@@ -49,7 +52,9 @@ WORKERS="${WORKERS:-8}"
 SAVE_FREQ="${SAVE_FREQ:-25000}"
 PREC="${PREC:-bf16}"
 DINO_ID="${DINO_ID:-facebook/dinov2-base}"
-XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/dino}"
+ENC="${ENC:-dino}"
+FRAMES="${FRAMES:-4}"
+XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/$ENC}"
 KV="${KV:-0}"
 [ "$KV" = "1" ] && KV_FLAG=true || KV_FLAG=false
 export ACCELERATE_MIXED_PRECISION="$PREC"
@@ -62,7 +67,7 @@ case "$MODE" in
     vision) DEFAULT_OUTPUT="outputs/hyper_lora_vision"; BATCH="${BATCH:-16}" ;;
     text)   DEFAULT_OUTPUT="outputs/hyper_lora_text";   BATCH="${BATCH:-32}" ;;
     lora)   DEFAULT_OUTPUT="outputs/lora_baseline";     BATCH="${BATCH:-32}" ;;
-    traj)   DEFAULT_OUTPUT="outputs/hyper_lora_traj";   BATCH="${BATCH:-32}" ;;
+    traj)   DEFAULT_OUTPUT="outputs/hyper_lora_traj_$ENC"; BATCH="${BATCH:-32}" ;;
     *) echo "ERROR: MODE must be vision | text | lora | traj, got '$MODE'" >&2; exit 1 ;;
 esac
 # Ablation toggles get distinct default output dirs so runs don't collide.
@@ -133,7 +138,8 @@ case "$MODE" in
             --policy.type=traj_hyper_lora_smolvla
             --policy.hn_use_traj_clip=true
             --policy.hn_xpair_cache_path="$XPAIR_CACHE"
-            --policy.hn_traj_encoder=dino
+            --policy.hn_traj_encoder="$ENC"
+            --policy.hn_traj_num_frames="$FRAMES"
             --policy.hn_inject_vlm_kv="$KV_FLAG"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"

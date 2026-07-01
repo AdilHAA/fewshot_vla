@@ -27,7 +27,7 @@ class TrajCache:
         self.records = meta["records"]
         self.keys = torch.load(os.path.join(out_dir, "keys.pt"))
         h = self.header
-        self._tok = h["num_frames"] * h["ntok"]
+        self._tok = h.get("n_tokens") or (h["num_frames"] * h["ntok"])
         self._d = h["d_enc"]
         n = h["n_clips"]
         path = os.path.join(out_dir, "clips.mmap")

@@ -25,7 +25,8 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     # Trajectory clip conditioning (OFF => single live frame, parent behaviour)
     hn_use_traj_clip: bool = False
     hn_traj_encoder: str = "dino"         # "dino" | "vjepa2"
-    hn_traj_num_frames: int = 4
+    hn_vjepa_model_id: str = "facebook/vjepa2-vitl-fpc64-256"  # used when encoder="vjepa2"
+    hn_traj_num_frames: int = 4           # vjepa2: use 16 (even; tubelet_size=2)
     hn_traj_frame_stride: int = 1
 
     # HN fusion extras (neutral => FusionHyperNetwork fast-path == parent)

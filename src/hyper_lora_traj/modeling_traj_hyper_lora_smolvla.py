@@ -193,37 +193,54 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             self._sent_enc = SentenceTransformer(sid)
 
     def _build_eval_conditioning(self, batch: Dict[str, Tensor]):
+        # Eval envs are vectorized: the buffer holds (B,C,H,W) frames per step, so the
+        # conditioning batch must match the observation batch.
         self._ensure_eval_encoders()
         dev = next(self._traj_encoder.parameters()).device
-        clip = self._frame_buf.clip().to(dev)  # (T,C,H,W) in [0,1]
-        traj_q = self._traj_encode(clip.unsqueeze(0))
+        clips = self._frame_buf.clip().to(dev).transpose(0, 1)  # (T,B,..) -> (B,T,C,H,W)
+        traj_q = self._traj_encode(clips)                        # (B, N, D)
+        bsz = traj_q.shape[0]
+        hdev = self._hypernet_device()
         source = getattr(self.config, "hn_traj_source", "self")
         if source == "self":
-            return traj_q.to(self._hypernet_device()), None
+            return traj_q.to(hdev), None
 
         task_index = self._eval_task_index(batch)
         # Fall back to self conditioning when task_index is unavailable at rollout time.
         if task_index is None:
-            return traj_q.to(self._hypernet_device()), None
+            return traj_q.to(hdev), None
 
         if source == "one_shot":
             eps = self._traj_cache.episodes_of_task(task_index)
             row = self._traj_cache._row.get((eps[0], 0)) if eps else None
             if row is None:
-                return traj_q.to(self._hypernet_device()), None
-            clips = self._traj_cache.read_rows([row]).to(dev)
-            return clips.reshape(1, -1, clips.shape[-1]).to(self._hypernet_device()), None
+                return traj_q.to(hdev), None
+            demo = self._traj_cache.read_rows([row]).reshape(1, -1, traj_q.shape[-1])
+            return demo.expand(bsz, -1, -1).to(hdev), None
 
-        # retrieval (headline)
-        frame_emb = traj_q[0].float().mean(dim=0)
-        text_emb = self._eval_text_emb(batch).to(frame_emb)
-        traj, mask, prov, fb = select_eval_conditioning(
-            self._traj_cache, traj_q[0], frame_emb, text_emb,
-            self.config.hn_retrieval_k, self.config.hn_retrieval_tau, task_index,
-            self.config.hn_retrieval_beta_t, self.config.hn_retrieval_beta_f,
-        )
-        logger.warning("[RETRIEVAL] task=%s fallback=%s provenance=%s", task_index, fb, prov)
-        return traj.to(self._hypernet_device()), mask
+        # retrieval (headline): per-env query; kill-switch fallbacks make lengths ragged
+        # across the batch -> pad to the longest and mask (True == ignore).
+        text_emb = self._eval_text_emb(batch)
+        frame_embs = traj_q.float().mean(dim=1)                  # (B, D)
+        parts, fallbacks, prov = [], 0, []
+        for b in range(bsz):
+            traj_b, _, prov_b, fb = select_eval_conditioning(
+                self._traj_cache, traj_q[b], frame_embs[b], text_emb.to(frame_embs),
+                self.config.hn_retrieval_k, self.config.hn_retrieval_tau, task_index,
+                self.config.hn_retrieval_beta_t, self.config.hn_retrieval_beta_f,
+            )
+            parts.append(traj_b[0])                              # (L_b, D)
+            fallbacks += int(fb)
+            prov = prov_b
+        lmax = max(p.shape[0] for p in parts)
+        traj = traj_q.new_zeros(bsz, lmax, traj_q.shape[-1])
+        mask = torch.ones(bsz, lmax, dtype=torch.bool, device=traj.device)
+        for b, p in enumerate(parts):
+            traj[b, : p.shape[0]] = p.to(traj)
+            mask[b, : p.shape[0]] = False
+        logger.warning("[RETRIEVAL] task=%s envs=%d fallbacks=%d provenance=%s",
+                       task_index, bsz, fallbacks, prov)
+        return traj.to(hdev), mask.to(hdev)
 
     def _eval_task_index(self, batch: Dict[str, Tensor]):
         # eval/rollout batches come from the env, not LeRobotDataset; task_index may be
@@ -248,8 +265,8 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
     @torch.no_grad()
     def select_action(self, batch, *args, **kwargs):
         if self._frame_buf is not None:
-            img = self._first_image(batch)  # (B,C,H,W) in [0,1]
-            self._frame_buf.push(img[0].detach())
+            # Full env batch: eval envs are vectorized, conditioning is per-env.
+            self._frame_buf.push(self._first_image(batch).detach())
         return super().select_action(batch, *args, **kwargs)
 
     def reset(self):

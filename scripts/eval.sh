@@ -36,6 +36,9 @@ BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
 TRAJ_SOURCE="${TRAJ_SOURCE:-}"
 [ -n "$TRAJ_SOURCE" ] && TRAJ_ARGS=(--policy.hn_traj_source="$TRAJ_SOURCE") || TRAJ_ARGS=()
+# Traj eval adapts once per episode: build the LoRA on the first frame, reuse for
+# the rollout (also keeps the clip encoder + retrieval off the per-step path).
+[ -n "$TRAJ_SOURCE" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
 
 # Guard: refuse to start if the GPU is already busy (avoids two-process OOM).
 if command -v nvidia-smi >/dev/null 2>&1; then

@@ -25,7 +25,7 @@ imageio
 # LIBERO simulator (eval-only). robosuite 1.4 is the last version compatible
 # with LIBERO; mujoco 3.x works in practice.
 robosuite==1.4.1
-mujoco
+mujoco<3.3  # newer mujoco changed the mj_fullM signature -> breaks robosuite 1.4 controllers
 bddl==1.0.1
 matplotlib
 cloudpickle

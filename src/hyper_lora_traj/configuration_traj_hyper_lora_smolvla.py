@@ -42,6 +42,7 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     # Trajectory source: train uses "self_sametask"; eval "retrieval" | "self" | "one_shot"
     hn_traj_source: str = "self_sametask"
     hn_p_self: float = 0.5                # P(self) in train self/same-task mix
+    hn_train_k: int = 1                   # concat up to k same-task demos per train sample
     hn_xpair_cache_path: str | None = None  # required when hn_use_traj_clip=True
     hn_retrieval_k: int = 6
     hn_retrieval_tau: float = 0.5         # cosine kill-switch threshold

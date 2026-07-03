@@ -22,24 +22,35 @@ def _choice(n: int, generator) -> int:
     return int(torch.randint(n, (1,), generator=generator)[0]) if n > 1 else 0
 
 
-def select_train_conditioning(cache, episode_idx, task_idx, p_self: float, generator):
-    """Per-sample self/same-task clip selection.
+def select_train_conditioning(cache, episode_idx, task_idx, p_self: float, generator, k: int = 1):
+    """Per-sample self/same-task clip selection, k_step demos concatenated per sample.
 
     episode_idx, task_idx: length-B int sequences (the imitated episode + its task).
-    Returns (traj (B, T*Ntok, D_enc), mask=None) — equal-length clips, no padding.
+    k_step ~ Uniform{1..k} is drawn once per batch so lengths stay equal across the
+    batch (no padding) and the model sees the multi-demo input eval retrieval feeds.
+    Returns (traj (B, k_step*n_tokens, D_enc), mask=None).
     """
     variants = _variants_by_episode(cache)
+    k_step = 1 + _choice(k, generator) if k > 1 else 1
+
+    def _read(ep):
+        vs = variants.get(ep, [0])
+        return cache.read(ep, vs[_choice(len(vs), generator)])
+
     clips = []
     for b in range(len(episode_idx)):
         ea, t = int(episode_idx[b]), int(task_idx[b])
         use_self = torch.rand(1, generator=generator).item() < p_self
         if use_self:
-            ep = ea
+            sel = [ea]
         else:
             cands = [e for e in cache.episodes_of_task(t) if e != ea] or [ea]
-            ep = cands[_choice(len(cands), generator)]
-        vs = variants.get(ep, [0])
-        clips.append(cache.read(ep, vs[_choice(len(vs), generator)]))
+            sel = [cands[_choice(len(cands), generator)]]
+        for _ in range(k_step - 1):  # extra demos: unseen same-task first, repeats ok
+            cands = [e for e in cache.episodes_of_task(t) if e not in sel] \
+                or cache.episodes_of_task(t) or [ea]
+            sel.append(cands[_choice(len(cands), generator)])
+        clips.append(torch.cat([_read(e) for e in sel], dim=0))
     return torch.stack(clips), None
 
 

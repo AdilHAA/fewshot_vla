@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -22,37 +23,49 @@ from src.traj_data.retrieval import build_key
 
 
 def build_records(episodes, encode, sent_encode, num_frames, stride,
-                  n_color, beta_t, beta_f, encoder_id, sent_id):
+                  n_color, beta_t, beta_f, encoder_id, sent_id,
+                  extra_variants=None, jitter="chan-gain-bias"):
     """Pure orchestration over an iterable of episode dicts. `encode` maps a clip
-    (1,T,C,H,W) in [0,1] -> (1, N, D). Returns (clips fp16, keys, records, header)."""
+    (1,T,C,H,W) in [0,1] -> (1, N, D). `extra_variants(episode_id)` may supply extra
+    pre-rendered clips as (variant_id, frames (T',C,H,W)) pairs (e.g. sim-recolor).
+    Returns (clips fp16, keys, records, header)."""
     clips_list, keys_list, records = [], [], []
     d_enc = d_text = n_tokens = None
     row = 0
+
+    def _emit(ep, clip, variant, text_emb):
+        nonlocal d_enc, n_tokens, row
+        toks = encode(clip.unsqueeze(0))[0].cpu()              # (N, D)
+        if d_enc is None:
+            n_tokens, d_enc = toks.shape[0], toks.shape[-1]
+        frame_emb = toks.float().mean(dim=0)                   # (D,)
+        keys_list.append(build_key(text_emb.float(), frame_emb, beta_t, beta_f))
+        clips_list.append(toks.numpy())
+        records.append({"episode": ep["episode"], "variant": variant,
+                        "task_index": ep["task_index"],
+                        "object_set": ep["object_set"], "row": row})
+        row += 1
+
     for ep in episodes:
         frames = ep["frames"]                                  # (n_avail,C,H,W)
         idx = opening_clip_indices(frames.shape[0], num_frames, stride)
         base_clip = frames[idx]                                # (T,C,H,W)
         text_emb = sent_encode(ep["instruction"])              # (Dtext,)
+        if d_text is None:
+            d_text = text_emb.shape[-1]
         for variant in range(1 + n_color):
             clip = base_clip if variant == 0 else color_jitter(
                 base_clip, seed=hash((ep["episode"], variant)) & 0x7FFFFFFF)
-            toks = encode(clip.unsqueeze(0))[0].cpu()          # (N, D)
-            if d_enc is None:
-                n_tokens, d_enc = toks.shape[0], toks.shape[-1]
-                d_text = text_emb.shape[-1]
-            frame_emb = toks.float().mean(dim=0)               # (D,)
-            key = build_key(text_emb.float(), frame_emb, beta_t, beta_f)
-            clips_list.append(toks.numpy())
-            keys_list.append(key)
-            records.append({"episode": ep["episode"], "variant": variant,
-                            "task_index": ep["task_index"],
-                            "object_set": ep["object_set"], "row": row})
-            row += 1
+            _emit(ep, clip, variant, text_emb)
+        if extra_variants is not None:
+            for variant, xclip in extra_variants(ep["episode"]):
+                xi = opening_clip_indices(xclip.shape[0], num_frames, stride)
+                _emit(ep, xclip[xi], variant, text_emb)
     clips = np.stack(clips_list).astype(np.float16)
     keys = torch.stack(keys_list)
     header = CacheHeader(
         encoder_id=encoder_id, num_frames=num_frames, stride=stride, window="opening",
-        jitter="chan-gain-bias", d_enc=d_enc, ntok=n_tokens // num_frames,
+        jitter=jitter, d_enc=d_enc, ntok=n_tokens // num_frames,
         n_tokens=n_tokens, sentence_encoder_id=sent_id, beta_t=beta_t, beta_f=beta_f,
         d_text=d_text, d_frame=d_enc, n_clips=row)
     return clips, keys, records, header
@@ -107,6 +120,8 @@ def main(argv=None):  # pragma: no cover (GPU)
     p.add_argument("--sentence_encoder", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--beta_t", type=float, default=1.0)
     p.add_argument("--beta_f", type=float, default=1.0)
+    p.add_argument("--rendered_dir", default=None,
+                   help="dir of ep*.npz sim-recolor clips (scripts/render_recolor_clips.py)")
     args = p.parse_args(argv)
 
     from sentence_transformers import SentenceTransformer
@@ -116,11 +131,33 @@ def main(argv=None):  # pragma: no cover (GPU)
     st = SentenceTransformer(args.sentence_encoder, device=device)
     sent_encode = lambda s: torch.tensor(st.encode(s), dtype=torch.float32)
 
+    # Pre-rendered sim-recolor clips join as extra variants after the jitter ones:
+    # variant = 1 + n_color + ordinal(color), stable via the globally sorted color list.
+    extra_variants, jitter = None, "chan-gain-bias"
+    if args.rendered_dir:
+        rendered: dict[int, list] = {}
+        for path in sorted(Path(args.rendered_dir).glob("ep*.npz")):
+            with np.load(path) as z:
+                rendered.setdefault(int(z["episode"]), []).append((str(z["color"]), path))
+        colors = sorted({c for lst in rendered.values() for c, _ in lst})
+        jitter = "chan-gain-bias+sim-recolor"
+
+        def extra_variants(ep_id):
+            out = []
+            for color, path in rendered.get(ep_id, []):
+                arr = np.load(path)["frames"]                  # (T,H,W,C) uint8
+                clip = torch.from_numpy(arr).permute(0, 3, 1, 2).float() / 255.0
+                out.append((1 + args.n_color + colors.index(color), clip))
+            return out
+
+        print(f"rendered variants: {sum(len(v) for v in rendered.values())} clips, "
+              f"colors={colors}")
+
     episodes = _load_episodes(args.repo_id, args.revision, args.num_frames, args.stride)
     clips, keys, records, header = build_records(
         episodes, encode, sent_encode, args.num_frames, args.stride,
         args.n_color, args.beta_t, args.beta_f, encoder_id=args.encoder,
-        sent_id=args.sentence_encoder)
+        sent_id=args.sentence_encoder, extra_variants=extra_variants, jitter=jitter)
     write_cache(args.out, clips, keys, records, header)
     print(f"wrote {header.n_clips} clips to {args.out}")
 

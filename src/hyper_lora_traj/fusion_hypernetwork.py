@@ -24,6 +24,7 @@ class FusionHyperNetwork(HyperNetwork):
         perceiver_latents: int = 8,
         perceiver_depth: int = 2,
         perceiver_heads: int = 4,
+        perceiver_max_seq_len: int = 8192,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -43,6 +44,7 @@ class FusionHyperNetwork(HyperNetwork):
                 num_latents=perceiver_latents,
                 depth=perceiver_depth,
                 num_heads=perceiver_heads,
+                max_seq_len=perceiver_max_seq_len,
             )
         if stream_type_emb:
             self.stream_type_embedding = nn.Embedding(4, self.hidden_size)

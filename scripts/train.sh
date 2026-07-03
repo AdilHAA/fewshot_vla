@@ -33,6 +33,8 @@
 #                                     --encoder $ENC --num_frames $FRAMES)
 #   KV         (0)                    1 = also inject LoRA at the VLM k/v routing
 #                                     site (traj mode)
+#   TRAIN_K    (1)                   traj mode: concat up to K same-task demos per
+#                                     train sample (match eval retrieval; try 3)
 #   WANDB      (1)                    1 = enable wandb logging
 #   WANDB_PROJECT (hyper-lora)        wandb project name
 
@@ -56,6 +58,7 @@ ENC="${ENC:-dino}"
 FRAMES="${FRAMES:-4}"
 XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/$ENC}"
 KV="${KV:-0}"
+TRAIN_K="${TRAIN_K:-1}"
 [ "$KV" = "1" ] && KV_FLAG=true || KV_FLAG=false
 export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "${WANDB:-1}" = "1" ] && WANDB_FLAG=true || WANDB_FLAG=false
@@ -140,6 +143,7 @@ case "$MODE" in
             --policy.hn_xpair_cache_path="$XPAIR_CACHE"
             --policy.hn_traj_encoder="$ENC"
             --policy.hn_traj_num_frames="$FRAMES"
+            --policy.hn_train_k="$TRAIN_K"
             --policy.hn_inject_vlm_kv="$KV_FLAG"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"

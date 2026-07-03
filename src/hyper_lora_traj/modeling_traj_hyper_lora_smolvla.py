@@ -37,6 +37,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         # Open the offline trajectory cache; traj feature dim comes from its header.
         self._traj_cache = None
         traj_dim = 0
+        perceiver_msl = 8192
         if config.hn_use_traj_clip:
             if not config.hn_xpair_cache_path:
                 raise ValueError("hn_use_traj_clip=True requires hn_xpair_cache_path")
@@ -45,7 +46,13 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             self._traj_cache = TrajCache(config.hn_xpair_cache_path)
             self._traj_cache.assert_header_matches(
                 num_frames=config.hn_traj_num_frames, encoder_id=config.hn_traj_encoder)
-            traj_dim = int(self._traj_cache.header["d_enc"])
+            hdr = self._traj_cache.header
+            traj_dim = int(hdr["d_enc"])
+            # Perceiver pos-emb must cover the longest demo concat (retrieval k or
+            # train k clips); e.g. V-JEPA2 clips are 2048 tokens -> k=6 needs 12288.
+            n_tok = int(hdr.get("n_tokens") or hdr["num_frames"] * hdr["ntok"])
+            k_max = max(config.hn_retrieval_k, getattr(config, "hn_train_k", 1), 1)
+            perceiver_msl = max(8192, k_max * n_tok)
 
         # Replace the plain HyperNetwork with FusionHyperNetwork over the same
         # target_modules. With all fusion flags off, params/forward are identical.
@@ -77,6 +84,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             perceiver_latents=config.hn_perceiver_latents,
             perceiver_depth=config.hn_perceiver_depth,
             perceiver_heads=config.hn_perceiver_heads,
+            perceiver_max_seq_len=perceiver_msl,
         )
         self._freeze_base()  # re-apply requires_grad to the new (Fusion) hypernet
 
@@ -169,7 +177,8 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             ep = ep.tolist() if hasattr(ep, "tolist") else list(ep)
             t = t.tolist() if hasattr(t, "tolist") else list(t)
             traj, mask = select_train_conditioning(
-                self._traj_cache, ep, t, self.config.hn_p_self, self._traj_gen
+                self._traj_cache, ep, t, self.config.hn_p_self, self._traj_gen,
+                k=getattr(self.config, "hn_train_k", 1),
             )
             return traj.to(self._hypernet_device()), mask
         return self._build_eval_conditioning(batch)

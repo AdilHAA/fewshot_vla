@@ -10,7 +10,7 @@ peft>=0.10.0
 wandb
 
 # lerobot — provides SmolVLAPolicy, LeRobotDataset, processors
-lerobot>=0.5.0
+lerobot==0.5.1  # 0.6+ needs av.option (breaks on new PyAV) and changes dataset APIs
 draccus
 num2words  # required by the SmolVLM processor under transformers>=5
 

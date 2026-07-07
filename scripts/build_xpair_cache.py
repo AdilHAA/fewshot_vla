@@ -121,7 +121,8 @@ def main(argv=None):  # pragma: no cover (GPU)
     p.add_argument("--beta_t", type=float, default=1.0)
     p.add_argument("--beta_f", type=float, default=1.0)
     p.add_argument("--rendered_dir", default=None,
-                   help="dir of ep*.npz sim-recolor clips (scripts/render_recolor_clips.py)")
+                   help="dir of ep*.npz rendered clips — sim-recolor and/or camera-jitter "
+                        "(scripts/render_recolor_clips.py)")
     args = p.parse_args(argv)
 
     from sentence_transformers import SentenceTransformer
@@ -131,8 +132,8 @@ def main(argv=None):  # pragma: no cover (GPU)
     st = SentenceTransformer(args.sentence_encoder, device=device)
     sent_encode = lambda s: torch.tensor(st.encode(s), dtype=torch.float32)
 
-    # Pre-rendered sim-recolor clips join as extra variants after the jitter ones:
-    # variant = 1 + n_color + ordinal(color), stable via the globally sorted color list.
+    # Pre-rendered clips (sim-recolor, camera-jitter) join as extra variants after the
+    # jitter ones: variant = 1 + n_color + ordinal(tag), stable via the sorted tag list.
     extra_variants, jitter = None, "chan-gain-bias"
     if args.rendered_dir:
         rendered: dict[int, list] = {}

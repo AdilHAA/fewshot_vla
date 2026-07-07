@@ -6,8 +6,12 @@ agentview frames — the exact same motion with a different appearance. Demo sta
 from the original LIBERO HDF5 datasets; hdf5 demos are matched to lerobot episodes by
 comparing action prefixes. Output feeds `build_xpair_cache.py --rendered_dir`.
 
+`--cam_jitters N` additionally renders N unrecolored variants per episode from a
+perturbed agentview camera (same states, shifted viewpoint) — saved as `ep*_camJ.npz`
+and picked up by the cache builder like any other rendered variant.
+
   python scripts/render_recolor_clips.py --colors red,green --num_frames 16 \
-      --out outputs/rendered_recolor
+      --cam_jitters 2 --out outputs/rendered_recolor
 """
 from __future__ import annotations
 
@@ -77,6 +81,25 @@ def match_demo(ep_actions: np.ndarray, demo_actions: dict, atol: float = 1e-4):
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def jitter_camera(base_pos: np.ndarray, base_quat: np.ndarray, rng,
+                  dpos: float, drot_deg: float) -> tuple[np.ndarray, np.ndarray]:
+    """Perturbed (pos, quat) for a fixed camera: uniform position offset plus a small
+    axis-angle rotation composed onto the base orientation (MuJoCo wxyz quats)."""
+    pos = base_pos + rng.uniform(-dpos, dpos, size=3)
+    axis = rng.normal(size=3)
+    axis /= np.linalg.norm(axis) + 1e-9
+    half = np.deg2rad(rng.uniform(-drot_deg, drot_deg)) / 2.0
+    w1, (x1, y1, z1) = np.cos(half), np.sin(half) * axis
+    w2, x2, y2, z2 = base_quat
+    quat = np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+    return pos, quat / np.linalg.norm(quat)
 
 
 # --- sim side (lazy imports; needs LIBERO + EGL) ---------------------------------------
@@ -179,6 +202,12 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--gate_mae", type=float, default=0.10,
                    help="max MAE between an unrecolored render and the dataset frame")
+    p.add_argument("--cam_jitters", type=int, default=0,
+                   help="extra unrecolored variants per episode from a jittered camera")
+    p.add_argument("--cam_pos_jitter", type=float, default=0.05,
+                   help="camera position jitter, meters (uniform per axis)")
+    p.add_argument("--cam_rot_jitter", type=float, default=5.0,
+                   help="camera rotation jitter, degrees (axis-angle)")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     args = p.parse_args(argv)
@@ -294,6 +323,34 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
                 np.savez_compressed(dst, frames=frames, episode=ep, color=color,
                                     task_index=task_index)
                 done += 1
+            env.close()
+
+        if args.cam_jitters:
+            env = _make_env(src_bddl)
+            cam_id = env.sim.model.camera_name2id("agentview")
+            base_pos = env.sim.model.cam_pos[cam_id].copy()
+            base_quat = env.sim.model.cam_quat[cam_id].copy()
+            for ep, start, demo in matches:
+                states = demo_states[demo]
+                idx = opening_clip_indices(states.shape[0], args.num_frames, args.stride)
+                for j in range(args.cam_jitters):
+                    dst = out_dir / f"ep{ep:05d}_cam{j}.npz"
+                    if dst.exists():
+                        continue
+                    rng = np.random.default_rng(ep * 7919 + j)
+                    pos, quat = jitter_camera(base_pos, base_quat, rng,
+                                              args.cam_pos_jitter, args.cam_rot_jitter)
+                    env.sim.model.cam_pos[cam_id] = pos
+                    env.sim.model.cam_quat[cam_id] = quat
+                    try:
+                        frames = _render_states(env, states[idx], flip)
+                    except Exception as e:
+                        logger.warning("episode %d/cam%d: render failed: %s", ep, j, e)
+                        skipped += 1
+                        continue
+                    np.savez_compressed(dst, frames=frames, episode=ep, color=f"cam{j}",
+                                        task_index=task_index)
+                    done += 1
             env.close()
 
     _contact_sheet(out_dir)

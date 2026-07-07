@@ -18,6 +18,8 @@
 #   OUT_ROOT  (outputs/eval_matrix)  root dir for all cells
 #   TRAJ_SOURCE ()                   traj policy eval mode: self | retrieval |
 #                                    one_shot (empty = leave the policy default)
+#   TRAJ_TAU  ()                     retrieval kill-switch threshold override
+#                                    (cosine; ckpt default 0.5; lower = retrieve more)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -36,6 +38,7 @@ BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
 TRAJ_SOURCE="${TRAJ_SOURCE:-}"
 [ -n "$TRAJ_SOURCE" ] && TRAJ_ARGS=(--policy.hn_traj_source="$TRAJ_SOURCE") || TRAJ_ARGS=()
+[ -n "${TRAJ_TAU:-}" ] && TRAJ_ARGS+=(--policy.hn_retrieval_tau="$TRAJ_TAU")
 # Traj eval adapts once per episode: build the LoRA on the first frame, reuse for
 # the rollout (also keeps the clip encoder + retrieval off the per-step path).
 [ -n "$TRAJ_SOURCE" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"

@@ -3,7 +3,7 @@ torch>=2.0.0
 torchvision
 torchaudio
 torchcodec
-transformers
+transformers==5.7.0  # 5.13 breaks lerobot 0.5.1 groot import + drifts SmolVLM tokenization
 huggingface-hub
 accelerate
 peft>=0.10.0

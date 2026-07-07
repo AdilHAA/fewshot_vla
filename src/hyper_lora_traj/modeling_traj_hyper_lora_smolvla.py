@@ -214,12 +214,14 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         if source == "self":
             return traj_q.to(hdev), None
 
+        # task_index is only needed to pick a same-task demo (one_shot) and for
+        # provenance labels; retrieval itself queries by [text ⊕ frames] and must
+        # NOT be gated on it (rollout batches usually lack task_index).
         task_index = self._eval_task_index(batch)
-        # Fall back to self conditioning when task_index is unavailable at rollout time.
-        if task_index is None:
-            return traj_q.to(hdev), None
 
         if source == "one_shot":
+            if task_index is None:  # cannot pick a same-task demo -> self fallback
+                return traj_q.to(hdev), None
             eps = self._traj_cache.episodes_of_task(task_index)
             row = self._traj_cache._row.get((eps[0], 0)) if eps else None
             if row is None:
@@ -231,11 +233,12 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         # across the batch -> pad to the longest and mask (True == ignore).
         text_emb = self._eval_text_emb(batch)
         frame_embs = traj_q.float().mean(dim=1)                  # (B, D)
+        prov_task = -1 if task_index is None else task_index     # -1: provenance unknown
         parts, fallbacks, prov = [], 0, []
         for b in range(bsz):
             traj_b, _, prov_b, fb = select_eval_conditioning(
                 self._traj_cache, traj_q[b], frame_embs[b], text_emb.to(frame_embs),
-                self.config.hn_retrieval_k, self.config.hn_retrieval_tau, task_index,
+                self.config.hn_retrieval_k, self.config.hn_retrieval_tau, prov_task,
                 self.config.hn_retrieval_beta_t, self.config.hn_retrieval_beta_f,
             )
             parts.append(traj_b[0])                              # (L_b, D)

@@ -200,6 +200,9 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
     p.add_argument("--colors", default="red,green")
     p.add_argument("--num_frames", type=int, default=16)
     p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--all_frames", action="store_true",
+                   help="render every recorded demo state (ignores --num_frames; "
+                        "--stride still subsamples)")
     p.add_argument("--gate_mae", type=float, default=0.10,
                    help="max MAE between an unrecolored render and the dataset frame")
     p.add_argument("--cam_jitters", type=int, default=0,
@@ -241,7 +244,9 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
         first = ds[start]
         by_task.setdefault(int(first["task_index"]), []).append((ep, start, length, first))
 
-    need = args.num_frames * args.stride
+    need = None if args.all_frames else args.num_frames * args.stride  # None -> load all states
+    clip_idx = ((lambda n: list(range(0, n, args.stride))) if args.all_frames
+                else (lambda n: opening_clip_indices(n, args.num_frames, args.stride)))
     done = skipped = 0
     for ti, (task_index, ep_list) in enumerate(sorted(by_task.items())):
         if ti % args.num_shards != args.shard:
@@ -313,7 +318,7 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
                 if dst.exists():
                     continue
                 states = demo_states[demo]
-                idx = opening_clip_indices(states.shape[0], args.num_frames, args.stride)
+                idx = clip_idx(states.shape[0])
                 try:
                     frames = _render_states(env, states[idx], flip)
                 except Exception as e:  # state-dim mismatch etc. — skip, keep going
@@ -332,7 +337,7 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
             base_quat = env.sim.model.cam_quat[cam_id].copy()
             for ep, start, demo in matches:
                 states = demo_states[demo]
-                idx = opening_clip_indices(states.shape[0], args.num_frames, args.stride)
+                idx = clip_idx(states.shape[0])
                 for j in range(args.cam_jitters):
                     dst = out_dir / f"ep{ep:05d}_cam{j}.npz"
                     if dst.exists():

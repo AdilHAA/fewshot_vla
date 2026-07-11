@@ -52,6 +52,21 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     hn_use_dino: bool = False        # additionally condition on a frozen external DINOv2
     hn_dino_model_id: str = "facebook/dinov2-base"
 
-    # Cache the generated adapter once per episode at eval time; breaks the
-    # vision-feedback loop. HN_LORA_CACHE={off,episode} overrides at runtime.
+    # At EVAL only: cache the generated LoRA adapter once per episode (computed on
+    # the first observation after reset) and reuse it for the whole rollout,
+    # instead of regenerating it every forward. The task is constant within an
+    # episode, so the adapter should be too. This breaks the vision-conditioned
+    # feedback loop (live frame -> HN -> LoRA -> action -> next frame) that makes
+    # a drifting arm feed itself out-of-distribution LoRA and diverge. No effect
+    # during training (the HN must keep regenerating to learn). Env var
+    # HN_LORA_CACHE={off,episode} overrides this at runtime.
     hn_lora_cache_eval: bool = False
+
+    # --- Init-frame pairing ablation (vision conditioning) ----------------------------
+    # "obs" = condition on the current observation (legacy). "same"/"cross" = at TRAIN
+    # time condition on the t=0 frame of the imitated episode / of another same-task
+    # episode, read from the first-frame bank. Eval always uses the rollout's own
+    # frames (freeze the adapter at t=0 via HN_LORA_CACHE=episode).
+    hn_frame_source: str = "obs"
+    hn_frame_bank_path: str | None = None
+    hn_bank_seed: int = 42

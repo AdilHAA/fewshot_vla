@@ -1,8 +1,11 @@
-"""Offline builder: encode every LIBERO episode (orig + color variants) into
-the trajectory cache (clips.mmap + keys.pt + index.json).
+"""Offline builder: encode every LIBERO episode (ALL frames; original + pre-rendered
+sim-recolor / camera-jitter variants) into the ragged trajectory cache
+(tokens.mmap + index.json). build_records/make_chunked are pure and unit-tested.
 
-  python scripts/build_xpair_cache.py --out outputs/xpair_cache/dino
-  python scripts/build_xpair_cache.py --encoder vjepa2 --num_frames 16 --out outputs/xpair_cache/vjepa2
+  python scripts/build_xpair_cache.py --encoder dino   --out outputs/xpair_cache/dino \
+      --rendered_dir outputs/rendered_recolor
+  python scripts/build_xpair_cache.py --encoder vjepa2 --out outputs/xpair_cache/vjepa2 \
+      --rendered_dir outputs/rendered_recolor
 """
 from __future__ import annotations
 
@@ -16,72 +19,56 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.traj_data.augment import color_jitter, opening_clip_indices
 from src.traj_data.cache_io import CacheHeader, write_cache
-from src.traj_data.encoder import build_traj_encoder
-from src.traj_data.retrieval import build_key
+from src.traj_data.encoder import ENCODER_FORMAT, build_traj_encoder
 
 
-def build_records(episodes, encode, sent_encode, num_frames, stride,
-                  n_color, beta_t, beta_f, encoder_id, sent_id,
-                  extra_variants=None, jitter="chan-gain-bias"):
-    """Pure orchestration over an iterable of episode dicts. `encode` maps a clip
-    (1,T,C,H,W) in [0,1] -> (1, N, D). `extra_variants(episode_id)` may supply extra
-    pre-rendered clips as (variant_id, frames (T',C,H,W)) pairs (e.g. sim-recolor).
-    Returns (clips fp16, keys, records, header)."""
-    clips_list, keys_list, records = [], [], []
-    d_enc = d_text = n_tokens = None
-    row = 0
+def make_chunked(encode, chunk: int, even: bool = False):
+    """Encode long clips in fixed-size temporal chunks and concat along tokens.
+    even=True trims the clip to an even frame count first (vjepa2 tubelet=2)."""
+    def _enc(clip):                                        # (1,T,C,H,W)
+        t = clip.shape[1]
+        if even and t % 2:
+            clip, t = clip[:, : t - 1], t - 1
+        outs = [encode(clip[:, i:i + chunk]) for i in range(0, t, chunk)]
+        return torch.cat(outs, dim=1)
+    return _enc
 
-    def _emit(ep, clip, variant, text_emb):
-        nonlocal d_enc, n_tokens, row
-        toks = encode(clip.unsqueeze(0))[0].cpu()              # (N, D)
-        if d_enc is None:
-            n_tokens, d_enc = toks.shape[0], toks.shape[-1]
-        frame_emb = toks.float().mean(dim=0)                   # (D,)
-        keys_list.append(build_key(text_emb.float(), frame_emb, beta_t, beta_f))
-        clips_list.append(toks.numpy())
+
+def build_records(episodes, encode, encoder_id: str, fmt: str, aug_set: str,
+                  extra_variants=None):
+    """episodes yield {"frames": (T,C,H,W) in [0,1], "instruction": str,
+    "episode": int, "task_index": int}. encode maps (1,T,C,H,W) -> (1,L,D).
+    extra_variants(episode_id) may supply [(variant_id, frames (T',C,H,W))]."""
+    seqs, records, task_texts = [], [], {}
+
+    def _emit(ep, clip, variant):
+        toks = encode(clip.unsqueeze(0))[0].cpu().numpy().astype(np.float16)
+        seqs.append(toks)
         records.append({"episode": ep["episode"], "variant": variant,
-                        "task_index": ep["task_index"],
-                        "object_set": ep["object_set"], "row": row})
-        row += 1
+                        "task_index": ep["task_index"]})
 
     for ep in episodes:
-        frames = ep["frames"]                                  # (n_avail,C,H,W)
-        idx = opening_clip_indices(frames.shape[0], num_frames, stride)
-        base_clip = frames[idx]                                # (T,C,H,W)
-        text_emb = sent_encode(ep["instruction"])              # (Dtext,)
-        if d_text is None:
-            d_text = text_emb.shape[-1]
-        for variant in range(1 + n_color):
-            clip = base_clip if variant == 0 else color_jitter(
-                base_clip, seed=hash((ep["episode"], variant)) & 0x7FFFFFFF)
-            _emit(ep, clip, variant, text_emb)
+        task_texts.setdefault(int(ep["task_index"]), ep["instruction"])
+        _emit(ep, ep["frames"], 0)
         if extra_variants is not None:
-            for variant, xclip in extra_variants(ep["episode"]):
-                xi = opening_clip_indices(xclip.shape[0], num_frames, stride)
-                _emit(ep, xclip[xi], variant, text_emb)
-    clips = np.stack(clips_list).astype(np.float16)
-    keys = torch.stack(keys_list)
-    header = CacheHeader(
-        encoder_id=encoder_id, num_frames=num_frames, stride=stride, window="opening",
-        jitter=jitter, d_enc=d_enc, ntok=n_tokens // num_frames,
-        n_tokens=n_tokens, sentence_encoder_id=sent_id, beta_t=beta_t, beta_f=beta_f,
-        d_text=d_text, d_frame=d_enc, n_clips=row)
-    return clips, keys, records, header
+            for variant, clip in extra_variants(ep["episode"]):
+                _emit(ep, clip, variant)
+    header = CacheHeader(encoder_id=encoder_id, format=fmt, d_enc=int(seqs[0].shape[-1]),
+                         aug_set=aug_set, num_records=len(records))
+    return seqs, records, header, task_texts
 
 
-def _load_episodes(repo_id, revision, num_frames, stride):  # pragma: no cover (GPU/dataset)
-    """Yield opening-clip dicts from lerobot/libero (LeRobotDataset 0.5.1). Only the
-    first T frames of each episode are decoded (cheap; leak-free)."""
+def _load_episodes(repo_id, revision):  # pragma: no cover (GPU/dataset)
+    """Yield full episodes from lerobot/libero (LeRobotDataset 0.5.1) — ALL frames."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     from src.data.libero import prefetch_all_data_parquets
 
-    prefetch_all_data_parquets(repo_id, revision)          # work around wrong file_index
+    prefetch_all_data_parquets(repo_id, revision)
     ds = LeRobotDataset(repo_id, revision=revision)
-    img_key = ds.meta.camera_keys[0]                       # main camera
-    eps = ds.meta.episodes                                 # v3.0: dataset_from/to_index cols
+    img_key = ds.meta.camera_keys[0]
+    eps = ds.meta.episodes
 
     def _erow(i):
         return eps.iloc[i].to_dict() if hasattr(eps, "iloc") else eps[i]
@@ -92,19 +79,13 @@ def _load_episodes(repo_id, revision, num_frames, stride):  # pragma: no cover (
         if row.get("dataset_from_index") is not None:
             start = int(row["dataset_from_index"])
             length = int(row["dataset_to_index"]) - start
-        else:                                              # fall back to cumulative length
+        else:
             start, length = acc, int(row["length"])
             acc += length
-        local = opening_clip_indices(length, num_frames, stride)
-        frames = torch.stack([ds[start + i][img_key] for i in local])  # (T,C,H,W) in [0,1]
+        frames = torch.stack([ds[start + i][img_key] for i in range(length)])
         first = ds[start]
-        yield {
-            "frames": frames,
-            "instruction": first.get("task", ""),
-            "episode": ep,
-            "task_index": int(first["task_index"]),
-            "object_set": str(int(first["task_index"])),
-        }
+        yield {"frames": frames, "instruction": first.get("task", ""),
+               "episode": ep, "task_index": int(first["task_index"])}
 
 
 def main(argv=None):  # pragma: no cover (GPU)
@@ -112,55 +93,46 @@ def main(argv=None):  # pragma: no cover (GPU)
     p.add_argument("--repo_id", default="lerobot/libero")
     p.add_argument("--revision", default="v3.0")
     p.add_argument("--encoder", default="dino")            # dino | vjepa2
-    p.add_argument("--encoder_model", default=None)        # override the HF model id
+    p.add_argument("--encoder_model", default=None)
     p.add_argument("--out", required=True)
-    p.add_argument("--num_frames", type=int, default=4)    # vjepa2: use 16 (even)
-    p.add_argument("--stride", type=int, default=1)
-    p.add_argument("--n_color", type=int, default=2)
-    p.add_argument("--sentence_encoder", default="sentence-transformers/all-MiniLM-L6-v2")
-    p.add_argument("--beta_t", type=float, default=1.0)
-    p.add_argument("--beta_f", type=float, default=1.0)
     p.add_argument("--rendered_dir", default=None,
-                   help="dir of ep*.npz rendered clips — sim-recolor and/or camera-jitter "
-                        "(scripts/render_recolor_clips.py)")
+                   help="dir of ep*.npz rendered variants (render_recolor_clips.py)")
+    p.add_argument("--chunk", type=int, default=0,
+                   help="temporal encode chunk (0 = auto: dino 64, vjepa2 32)")
     args = p.parse_args(argv)
-
-    from sentence_transformers import SentenceTransformer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _, encode = build_traj_encoder(args.encoder, args.encoder_model, device)
-    st = SentenceTransformer(args.sentence_encoder, device=device)
-    sent_encode = lambda s: torch.tensor(st.encode(s), dtype=torch.float32)
+    chunk = args.chunk or (32 if args.encoder == "vjepa2" else 64)
+    encode = make_chunked(encode, chunk, even=(args.encoder == "vjepa2"))
 
-    # Pre-rendered clips (sim-recolor, camera-jitter) join as extra variants after the
-    # jitter ones: variant = 1 + n_color + ordinal(tag), stable via the sorted tag list.
-    extra_variants, jitter = None, "chan-gain-bias"
+    extra_variants, aug_set = None, "orig"
     if args.rendered_dir:
         rendered: dict[int, list] = {}
         for path in sorted(Path(args.rendered_dir).glob("ep*.npz")):
             with np.load(path) as z:
                 rendered.setdefault(int(z["episode"]), []).append((str(z["color"]), path))
-        colors = sorted({c for lst in rendered.values() for c, _ in lst})
-        jitter = "chan-gain-bias+sim-recolor"
+        tags = sorted({c for lst in rendered.values() for c, _ in lst})
+        aug_set = "orig+" + "+".join(tags)
 
         def extra_variants(ep_id):
             out = []
-            for color, path in rendered.get(ep_id, []):
-                arr = np.load(path)["frames"]                  # (T,H,W,C) uint8
+            for tag, path in rendered.get(ep_id, []):
+                with np.load(path) as z:
+                    arr = z["frames"]                      # (T,H,W,C) uint8
                 clip = torch.from_numpy(arr).permute(0, 3, 1, 2).float() / 255.0
-                out.append((1 + args.n_color + colors.index(color), clip))
+                out.append((1 + tags.index(tag), clip))
             return out
 
-        print(f"rendered variants: {sum(len(v) for v in rendered.values())} clips, "
-              f"colors={colors}")
+        print(f"rendered variants: {sum(len(v) for v in rendered.values())} clips, tags={tags}")
 
-    episodes = _load_episodes(args.repo_id, args.revision, args.num_frames, args.stride)
-    clips, keys, records, header = build_records(
-        episodes, encode, sent_encode, args.num_frames, args.stride,
-        args.n_color, args.beta_t, args.beta_f, encoder_id=args.encoder,
-        sent_id=args.sentence_encoder, extra_variants=extra_variants, jitter=jitter)
-    write_cache(args.out, clips, keys, records, header)
-    print(f"wrote {header.n_clips} clips to {args.out}")
+    episodes = _load_episodes(args.repo_id, args.revision)
+    seqs, records, header, task_texts = build_records(
+        episodes, encode, args.encoder, ENCODER_FORMAT[args.encoder], aug_set,
+        extra_variants=extra_variants)
+    write_cache(args.out, seqs, records, header, task_texts)
+    print(f"wrote {header.num_records} records "
+          f"({sum(s.shape[0] for s in seqs)} tokens) to {args.out}")
 
 
 if __name__ == "__main__":  # pragma: no cover

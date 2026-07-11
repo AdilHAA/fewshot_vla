@@ -1,7 +1,9 @@
-"""Frozen-encoder helper: trajectory frames -> token latents.
+"""Shared frozen-encoder helper: trajectory frames -> token latents.
 
-Used by both the offline cache builder and the live eval path so the
-resize/normalize/dtype pipeline stays identical in both contexts.
+Used by BOTH the offline cache builder and (in P3) the eval live path, so the
+exact resize/normalize/dtype pipeline is identical offline and online. The
+parent policy's single-frame `_dino_features` is a separate legacy path and is
+NOT touched.
 """
 from __future__ import annotations
 
@@ -10,6 +12,8 @@ import torch.nn.functional as F
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+ENCODER_FORMAT = {"dino": "cls", "vjepa2": "tubelet_meanpool"}
 
 
 def imagenet_buffers(device, dtype):
@@ -20,19 +24,15 @@ def imagenet_buffers(device, dtype):
 
 @torch.no_grad()
 def dino_encode(model, mean, std, frames: torch.Tensor) -> torch.Tensor:
-    """frames: (B,T,C,H,W) in [0,1] -> (B, T*Ntok, D) fp16, frozen/no-grad.
-
-    Frames are concatenated along the token axis; CLS token is kept.
-    """
+    """frames: (B,T,C,H,W) in [0,1] -> (B, T, D) fp16 — the CLS token of every frame."""
     b, t, c, h, w = frames.shape
     x = frames.reshape(b * t, c, h, w)
     x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
     x = (x - mean) / std
     model_dtype = next(model.parameters()).dtype
     out = model(pixel_values=x.to(model_dtype))
-    tok = out.last_hidden_state                      # (B*T, Ntok, D)
-    ntok, d = tok.shape[1], tok.shape[2]
-    return tok.reshape(b, t * ntok, d).to(torch.float16)
+    cls = out.last_hidden_state[:, 0]                     # (B*T, D)
+    return cls.reshape(b, t, -1).to(torch.float16)
 
 
 VJEPA2_SIZE = 256
@@ -40,17 +40,18 @@ VJEPA2_SIZE = 256
 
 @torch.no_grad()
 def vjepa2_encode(model, mean, std, frames: torch.Tensor) -> torch.Tensor:
-    """frames: (B,T,C,H,W) in [0,1] -> (B, N, D) fp16, frozen/no-grad.
-
-    V-JEPA2 is a video encoder: it returns spatiotemporal tokens for the whole
-    clip (not per-frame). T should be even (tubelet_size=2).
-    """
+    """frames: (B,T,C,H,W), T even -> (B, T//2, D) fp16 — mean of the spatial tokens
+    inside each tubelet (V-JEPA2 has no CLS; this is the per-tubelet analog)."""
     b, t, c, h, w = frames.shape
+    assert t % 2 == 0, "vjepa2 needs an even frame count (tubelet_size=2)"
     x = frames.reshape(b * t, c, h, w)
     x = F.interpolate(x, size=(VJEPA2_SIZE, VJEPA2_SIZE), mode="bilinear", align_corners=False)
-    x = (x - mean) / std
-    x = x.reshape(b, t, c, VJEPA2_SIZE, VJEPA2_SIZE).to(next(model.parameters()).dtype)
-    return model.get_vision_features(x).to(torch.float16)
+    x = ((x - mean) / std).reshape(b, t, c, VJEPA2_SIZE, VJEPA2_SIZE)
+    model_dtype = next(model.parameters()).dtype
+    tok = model.get_vision_features(x.to(model_dtype))    # (B, (T//2)*n_sp, D)
+    n_tub = t // 2
+    n_sp = tok.shape[1] // n_tub
+    return tok.reshape(b, n_tub, n_sp, -1).mean(dim=2).to(torch.float16)
 
 
 _ENCODE_FN = {"dino": dino_encode, "vjepa2": vjepa2_encode}

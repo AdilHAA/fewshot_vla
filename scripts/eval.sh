@@ -16,10 +16,9 @@
 #   EPISODES  (50)                episodes per task (BATCH must divide it)
 #   BATCH     (2)                 parallel envs per task (24GB -> 2)
 #   OUT_ROOT  (outputs/eval_matrix)  root dir for all cells
-#   TRAJ_SOURCE ()                   traj policy eval mode: self | retrieval |
-#                                    one_shot (empty = leave the policy default)
-#   TRAJ_TAU  ()                     retrieval kill-switch threshold override
-#                                    (cosine; ckpt default 0.5; lower = retrieve more)
+#   EPISODE_CACHE (0)                set to 1 to build the adapter once per episode
+#                                    (REQUIRED for traj policies; also used by the
+#                                    vision init-frame ablations)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -36,12 +35,7 @@ SEEDS="${SEEDS:-1000 2000 3000}"
 EPISODES="${EPISODES:-50}"
 BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
-TRAJ_SOURCE="${TRAJ_SOURCE:-}"
-[ -n "$TRAJ_SOURCE" ] && TRAJ_ARGS=(--policy.hn_traj_source="$TRAJ_SOURCE") || TRAJ_ARGS=()
-[ -n "${TRAJ_TAU:-}" ] && TRAJ_ARGS+=(--policy.hn_retrieval_tau="$TRAJ_TAU")
-# Traj eval adapts once per episode: build the LoRA on the first frame, reuse for
-# the rollout (also keeps the clip encoder + retrieval off the per-step path).
-[ -n "$TRAJ_SOURCE" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
+[ "${EPISODE_CACHE:-0}" != "0" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
 
 # Guard: refuse to start if the GPU is already busy (avoids two-process OOM).
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -72,7 +66,6 @@ for entry in $POLICIES; do
             echo "==> eval [$label | $task | seed=$seed] | episodes=$EPISODES | batch=$BATCH"
             python eval_hyper_lora.py \
                 --policy.path="$path" \
-                "${TRAJ_ARGS[@]}" \
                 --env.type=libero --env.task="$task" \
                 --eval.n_episodes="$EPISODES" --eval.batch_size="$BATCH" \
                 --seed="$seed" \

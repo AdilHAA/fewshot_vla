@@ -1,22 +1,17 @@
-"""On-disk cache reader: clip reads + brute-force cosine retrieval + provenance."""
+"""On-disk ragged cache reader: per-record token reads + base-task lookup."""
 from __future__ import annotations
 
+import difflib
 import json
 import os
-from dataclasses import dataclass
+import re
 
 import numpy as np
 import torch
 
-from .retrieval import cosine_topk
 
-
-@dataclass
-class RetrievalResult:
-    rows: list
-    sims: list
-    kill_switch: bool
-    provenance: list
+def norm_text(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
 class TrajCache:
@@ -25,46 +20,36 @@ class TrajCache:
             meta = json.load(fh)
         self.header = meta["header"]
         self.records = meta["records"]
-        self.keys = torch.load(os.path.join(out_dir, "keys.pt"))
-        h = self.header
-        self._tok = h.get("n_tokens") or (h["num_frames"] * h["ntok"])
-        self._d = h["d_enc"]
-        n = h["n_clips"]
-        path = os.path.join(out_dir, "clips.mmap")
-        # fp16 = 2 bytes; validate before mmap to catch truncated writes early.
-        expected = n * self._tok * self._d * 2
+        self._d = int(self.header["d_enc"])
+        total = sum(r["length"] for r in self.records)
+        path = os.path.join(out_dir, "tokens.mmap")
+        expected = total * self._d * 2                     # fp16 = 2 bytes
         actual = os.path.getsize(path)
-        assert actual == expected, f"clips.mmap size {actual} != expected {expected}"
-        self.clips = np.memmap(path, dtype=np.float16, mode="r",
-                               shape=(n, self._tok, self._d))
-        self._row = {(r["episode"], r["variant"]): r["row"] for r in self.records}
-        self._task_eps: dict = {}
-        for r in self.records:
-            self._task_eps.setdefault(r["task_index"], set()).add(r["episode"])
-        self._row_task = {r["row"]: r["task_index"] for r in self.records}
+        assert actual == expected, f"tokens.mmap size {actual} != expected {expected}"
+        self.tokens = np.memmap(path, dtype=np.float16, mode="r", shape=(total, self._d))
+        self._by_task: dict = {}
+        for i, r in enumerate(self.records):
+            self._by_task.setdefault(r["task_index"], []).append(i)
+        self._text_to_task = {norm_text(v): int(k)
+                              for k, v in meta.get("task_texts", {}).items()}
 
     def assert_header_matches(self, **expected) -> None:
         for k, v in expected.items():
             got = self.header.get(k)
             assert got == v, f"cache header.{k}={got} != expected {v}"
 
-    def read(self, episode: int, variant: int) -> torch.Tensor:
-        row = self._row.get((episode, variant))
-        if row is None:
-            raise KeyError(f"(episode={episode}, variant={variant}) not in cache")
-        return torch.from_numpy(np.asarray(self.clips[row]).copy())
+    def read_row(self, row: int) -> torch.Tensor:
+        r = self.records[row]
+        a = np.asarray(self.tokens[r["offset"]:r["offset"] + r["length"]]).copy()
+        return torch.from_numpy(a)
 
-    def read_rows(self, rows: list) -> torch.Tensor:
-        return torch.stack([torch.from_numpy(np.asarray(self.clips[r]).copy()) for r in rows])
+    def rows_of_task(self, task_index: int) -> list:
+        return list(self._by_task.get(task_index, []))
 
-    def episodes_of_task(self, task_index: int) -> list:
-        return sorted(self._task_eps.get(task_index, set()))
-
-    def retrieve(self, query: torch.Tensor, k: int, tau: float,
-                 query_task_index: int) -> RetrievalResult:
-        idx, sims, kill = cosine_topk(query, self.keys, k=k, tau=tau)
-        rows = idx.tolist()
-        prov = ["same_task" if self._row_task[r] == query_task_index
-                else "different_task" for r in rows]
-        return RetrievalResult(rows=rows, sims=sims.tolist(), kill_switch=kill,
-                               provenance=prov)
+    def resolve_task(self, text: str):
+        """Instruction -> task_index: exact normalized match, then fuzzy (paraphrases)."""
+        n = norm_text(text)
+        if n in self._text_to_task:
+            return self._text_to_task[n]
+        hit = difflib.get_close_matches(n, list(self._text_to_task), n=1, cutoff=0.6)
+        return self._text_to_task[hit[0]] if hit else None

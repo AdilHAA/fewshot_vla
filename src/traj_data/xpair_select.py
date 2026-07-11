@@ -1,71 +1,67 @@
-"""Cross-pair conditioning selectors for train and eval.
-
-Train: per-sample self/same-task selection from a TrajCache (color variants
-enter via random variant choice). Eval: retrieval with a kill-switch fallback
-to the self clip. All logic is pure torch + cache.
-"""
+"""Leave-one-out conditioning selectors: train pairing (same | loo) and the eval
+task-demo pool. All functions are lerobot-free and unit-tested."""
 from __future__ import annotations
 
 import torch
 
-from .retrieval import build_key
+
+def _choice(n: int, g: torch.Generator) -> int:
+    return int(torch.randint(n, (1,), generator=g).item())
 
 
-def _variants_by_episode(cache) -> dict:
-    m: dict = {}
-    for r in cache.records:
-        m.setdefault(r["episode"], []).append(r["variant"])
-    return m
+def pack_conditioning(samples):
+    """samples: per-batch-item lists of (L_i, D) demo tensors -> padded batch.
+    Returns (traj (B,Lmax,D), mask (B,Lmax) True==pad, marks (B,Lmax) long with
+    1 on each demo's first token, 2 on its last, 0 elsewhere)."""
+    B = len(samples)
+    lens = [sum(d.shape[0] for d in demos) for demos in samples]
+    L, D = max(lens), samples[0][0].shape[-1]
+    traj = samples[0][0].new_zeros(B, L, D)
+    mask = torch.ones(B, L, dtype=torch.bool)
+    marks = torch.zeros(B, L, dtype=torch.long)
+    for b, demos in enumerate(samples):
+        off = 0
+        for d in demos:
+            n = d.shape[0]
+            traj[b, off:off + n] = d
+            marks[b, off] = 1
+            marks[b, off + n - 1] = 2
+            off += n
+        mask[b, :off] = False
+    return traj, mask, marks
 
 
-def _choice(n: int, generator) -> int:
-    return int(torch.randint(n, (1,), generator=generator)[0]) if n > 1 else 0
-
-
-def select_train_conditioning(cache, episode_idx, task_idx, p_self: float, generator, k: int = 1):
-    """Per-sample self/same-task clip selection, k_step demos concatenated per sample.
-
-    episode_idx, task_idx: length-B int sequences (the imitated episode + its task).
-    k_step ~ Uniform{1..k} is drawn once per batch so lengths stay equal across the
-    batch (no padding) and the model sees the multi-demo input eval retrieval feeds.
-    Returns (traj (B, k_step*n_tokens, D_enc), mask=None).
-    """
-    variants = _variants_by_episode(cache)
-    k_step = 1 + _choice(k, generator) if k > 1 else 1
-
-    def _read(ep):
-        vs = variants.get(ep, [0])
-        return cache.read(ep, vs[_choice(len(vs), generator)])
-
-    clips = []
+def select_train_conditioning(cache, episode_idx, task_idx, pair_mode: str,
+                              k: int, generator: torch.Generator):
+    """pair_mode='same': a random variant of the imitated episode itself.
+    pair_mode='loo': k_step~U{1..k} same-task demos EXCLUDING the imitated episode
+    (any variant, no repeats while the pool allows); resampled every call.
+    Single-episode tasks fall back to 'same'."""
+    samples = []
     for b in range(len(episode_idx)):
-        ea, t = int(episode_idx[b]), int(task_idx[b])
-        use_self = torch.rand(1, generator=generator).item() < p_self
-        if use_self:
-            sel = [ea]
+        ep, t = int(episode_idx[b]), int(task_idx[b])
+        rows = cache.rows_of_task(t)
+        own = [r for r in rows if cache.records[r]["episode"] == ep] or rows
+        other = [r for r in rows if cache.records[r]["episode"] != ep]
+        if pair_mode == "same" or not other:
+            sel = [own[_choice(len(own), generator)]]
         else:
-            cands = [e for e in cache.episodes_of_task(t) if e != ea] or [ea]
-            sel = [cands[_choice(len(cands), generator)]]
-        for _ in range(k_step - 1):  # extra demos: unseen same-task first, repeats ok
-            cands = [e for e in cache.episodes_of_task(t) if e not in sel] \
-                or cache.episodes_of_task(t) or [ea]
-            sel.append(cands[_choice(len(cands), generator)])
-        clips.append(torch.cat([_read(e) for e in sel], dim=0))
-    return torch.stack(clips), None
+            k_step = 1 + _choice(k, generator) if k > 1 else 1
+            if len(other) >= k_step:
+                perm = torch.randperm(len(other), generator=generator).tolist()
+                sel = [other[i] for i in perm[:k_step]]
+            else:
+                sel = [other[_choice(len(other), generator)] for _ in range(k_step)]
+        samples.append([cache.read_row(r) for r in sel])
+    return pack_conditioning(samples)
 
 
-def select_eval_conditioning(cache, query_clip, frame_emb, text_emb, k: int, tau: float,
-                             query_task_index: int, beta_t: float, beta_f: float):
-    """Retrieval conditioning with kill-switch to the self clip.
-
-    query_clip: (T*Ntok, D_enc) live opening clip (also the self fallback).
-    frame_emb: (D_frame,) pooled query frame emb; text_emb: (D_text,).
-    Returns (traj (1, L, D_enc), mask=None, provenance: list[str], used_fallback: bool).
-    """
-    query = build_key(text_emb, frame_emb, beta_t, beta_f)
-    res = cache.retrieve(query, k=k, tau=tau, query_task_index=query_task_index)
-    if res.kill_switch:
-        return query_clip.unsqueeze(0), None, ["self_fallback"], True
-    clips = cache.read_rows(res.rows)                     # (k, T*Ntok, D)
-    traj = clips.reshape(1, -1, clips.shape[-1])          # (1, k*T*Ntok, D)
-    return traj, None, res.provenance, False
+def select_eval_conditioning(cache, task_index: int, k: int, seed: int):
+    """Deterministic K demos of the task (originals + augmented variants). Returns a
+    list of (L,D) tensors; the caller packs across envs."""
+    rows = cache.rows_of_task(task_index)
+    if not rows:
+        raise KeyError(f"no cached demos for task {task_index}")
+    g = torch.Generator().manual_seed(int(seed) + int(task_index))
+    perm = torch.randperm(len(rows), generator=g).tolist()
+    return [cache.read_row(rows[i]) for i in perm[:k]]

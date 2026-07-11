@@ -1,7 +1,17 @@
-"""FusionHyperNetwork — backward-compatible HyperNetwork subclass that fuses extra
-conditioning streams (trajectory-clip latents via a Perceiver resampler, per-stream
-type embeddings) into LoRA generation. With all flags off, forward delegates to the
-parent and the module has no extra parameters.
+"""FusionHyperNetwork — a backward-compatible subclass of the base HyperNetwork that
+fuses extra conditioning streams (raw per-timestep trajectory tokens, per-stream type
+embeddings) into LoRA generation.
+
+Backward-compat: every fusion feature is default-OFF. When none is active, `forward`
+delegates to the parent `HyperNetwork.forward` and the module has NO extra parameters,
+so its state_dict is identical to the parent's (`tests/test_traj_backcompat.py`).
+
+Active (Stage>=2) path: when `use_traj`, the raw frozen-encoder trajectory tokens
+`traj_embeds` are projected (`traj_proj`: traj_dim -> hidden) straight into the concat
+self-attention as a 4th stream in the tf sequence `[layer | text | (vision) | traj]`.
+Demo boundaries are injected as additive mark embeddings (`traj_mark_embedding`:
+1=demo-start, 2=demo-end, 0=interior). The layer tokens are read back and decoded to
+`(W_down, W_up)` exactly as in the parent. Requires `encoder_type='tf'`.
 """
 
 from __future__ import annotations
@@ -21,31 +31,20 @@ class FusionHyperNetwork(HyperNetwork):
         stream_type_emb: bool = False,
         per_stream_null: bool = False,
         readout: str = "queries",
-        perceiver_latents: int = 8,
-        perceiver_depth: int = 2,
-        perceiver_heads: int = 4,
-        perceiver_max_seq_len: int = 8192,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)  # base HyperNetwork; lines unchanged
         self.use_traj = use_traj
         self.stream_type_emb = stream_type_emb
         self.per_stream_null = per_stream_null
         self.readout = readout
-        # Extra params constructed only behind their flag — an all-OFF instance has
-        # exactly the parent's parameter/state_dict keys.
+        # Extra params are constructed ONLY behind their flag, so an all-OFF instance
+        # has exactly the parent's parameter/state_dict keys (byte-compat).
         if use_traj:
-            # Lazy import so the all-OFF path has no dependency on traj_data.
-            from src.traj_data.perceiver import PerceiverResampler
-
-            self.perceiver = PerceiverResampler(
-                input_dim=traj_dim,
-                hidden_size=self.hidden_size,
-                num_latents=perceiver_latents,
-                depth=perceiver_depth,
-                num_heads=perceiver_heads,
-                max_seq_len=perceiver_max_seq_len,
-            )
+            # Raw per-timestep tokens go straight into the concat self-attention;
+            # boundaries between demos are additive mark embeddings (1=start, 2=end).
+            self.traj_proj = nn.Linear(traj_dim, self.hidden_size)
+            self.traj_mark_embedding = nn.Embedding(3, self.hidden_size)
         if stream_type_emb:
             self.stream_type_embedding = nn.Embedding(4, self.hidden_size)
 
@@ -65,9 +64,11 @@ class FusionHyperNetwork(HyperNetwork):
         dino_embeds=None,
         traj_embeds=None,
         traj_mask=None,
+        traj_marks=None,
         **kwargs,
     ):
-        # Fast-path: numerically identical to parent when no fusion feature is active.
+        # Fast-path: with no fusion feature active this is numerically and structurally
+        # identical to the parent.
         if not self._new_active():
             return super().forward(
                 text_token_embeds, attention_mask, vlm_vision_embeds, dino_embeds
@@ -101,10 +102,15 @@ class FusionHyperNetwork(HyperNetwork):
             stream_ids += [2] * v.shape[1]
 
         if self.use_traj and traj_embeds is not None:
-            traj_lat = self.perceiver(traj_embeds.to(param_dtype), key_padding_mask=traj_mask)
-            seq_parts.append(traj_lat)
-            pad_parts.append(torch.zeros(B, traj_lat.shape[1], device=device, dtype=torch.bool))
-            stream_ids += [3] * traj_lat.shape[1]
+            tr = self.traj_proj(traj_embeds.to(param_dtype))
+            if traj_marks is not None:
+                tr = tr + self.traj_mark_embedding(traj_marks.to(device))
+            seq_parts.append(tr)
+            if traj_mask is not None:
+                pad_parts.append(traj_mask.to(device))
+            else:
+                pad_parts.append(torch.zeros(B, tr.shape[1], device=device, dtype=torch.bool))
+            stream_ids += [3] * tr.shape[1]
 
         seq = torch.cat(seq_parts, dim=1)
         src_key_padding_mask = torch.cat(pad_parts, dim=1)

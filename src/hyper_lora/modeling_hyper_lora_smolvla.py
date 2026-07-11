@@ -71,6 +71,15 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
             zero_init_up=config.hn_zero_init_up,
         )
         self._freeze_base()
+
+        # Init-frame pairing ablation (vision conditioning). Lazily built bank +
+        # deterministic generator; validated eagerly so a misconfigured run fails
+        # at construction rather than mid-training.
+        self._frame_bank = None
+        self._bank_gen = torch.Generator().manual_seed(int(getattr(config, "hn_bank_seed", 42)))
+        if getattr(config, "hn_frame_source", "obs") != "obs" and not config.hn_frame_bank_path:
+            raise ValueError("hn_frame_source != 'obs' requires hn_frame_bank_path")
+
         self._lora_cache = None
         self._prev_lora_flat = None
         self._lora_step = 0
@@ -78,6 +87,8 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         self._act_step = 0
 
     def reset(self):
+        """Called by lerobot at each environment reset. Drop the per-episode
+        LoRA cache and drift-logging state so the next episode starts fresh."""
         super().reset()
         self._lora_cache = None
         self._prev_lora_flat = None
@@ -93,7 +104,8 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         return a
 
     def _log_action(self, a: Tensor) -> None:
-        # Norm, jerk, and max-abs: cheap behavioral probe for divergence/jitter.
+        """Log executed-action norm, step-to-step jerk, and max abs component — a
+        GPU-free behavioral probe for divergence/jitter. Enabled with HN_LOG_ACTION=1."""
         x = a.detach().float()
         flat = x.reshape(x.shape[0], -1) if x.ndim > 1 else x.reshape(1, -1)
         prev = self._prev_action
@@ -107,30 +119,6 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         logger.warning(
             "[ACT] step=%d a_norm=%.4f jerk=%.4f amax=%.4f",
             self._act_step, flat.norm(dim=-1).mean().item(), jerk, x.abs().max().item(),
-        )
-
-    def _lora_cache_mode(self) -> str:
-        # Env var wins over config; never cache during training.
-        env = os.environ.get("HN_LORA_CACHE")
-        if env:
-            return env.strip().lower()
-        return "episode" if getattr(self.config, "hn_lora_cache_eval", False) else "off"
-
-    def _log_lora_drift(self, weights) -> None:
-        # L2 norm of all generated LoRA params and step-to-step delta. HN_LOG_LORA=1.
-        flat = torch.cat(
-            [t.reshape(-1) for layers in weights.values() for pair in layers.values() for t in pair]
-        ).float()
-        prev = self._prev_lora_flat
-        drift = (
-            (flat - prev).norm().item()
-            if prev is not None and prev.numel() == flat.numel()
-            else float("nan")
-        )
-        self._prev_lora_flat = flat.detach()
-        self._lora_step += 1
-        logger.warning(
-            "[HN] step=%d lora_norm=%.4f step_drift=%.4f", self._lora_step, flat.norm().item(), drift
         )
 
     def _load_base_smolvla_weights(self, path: str) -> None:
@@ -260,6 +248,56 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
     def _embed_language(self, lang_tokens: Tensor) -> Tensor:
         return self.model.vlm_with_expert.embed_language_tokens(lang_tokens)
 
+    def _lora_cache_mode(self) -> str:
+        """'episode' = generate the adapter once per rollout and reuse it; 'off'
+        = regenerate every forward (legacy). Env var HN_LORA_CACHE wins over the
+        config default. Never caches during training."""
+        env = os.environ.get("HN_LORA_CACHE")
+        if env:
+            return env.strip().lower()
+        return "episode" if getattr(self.config, "hn_lora_cache_eval", False) else "off"
+
+    def _log_lora_drift(self, weights) -> None:
+        """Log L2 norm of all generated LoRA params and the L2 change since the
+        previous forward — a cheap probe for the vision-conditioned feedback
+        loop. Enabled with env var HN_LOG_LORA=1."""
+        flat = torch.cat(
+            [t.reshape(-1) for layers in weights.values() for pair in layers.values() for t in pair]
+        ).float()
+        prev = self._prev_lora_flat
+        drift = (
+            (flat - prev).norm().item()
+            if prev is not None and prev.numel() == flat.numel()
+            else float("nan")
+        )
+        self._prev_lora_flat = flat.detach()
+        self._lora_step += 1
+        logger.warning(
+            "[HN] step=%d lora_norm=%.4f step_drift=%.4f", self._lora_step, flat.norm().item(), drift
+        )
+
+    def _bank_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Swap every image key for the pairing frame (t=0 of the imitated episode for
+        'same', of another same-task episode for 'cross'). Text/action keys untouched."""
+        if self._frame_bank is None:
+            from src.traj_data.frame_bank import FrameBank
+
+            self._frame_bank = FrameBank(self.config.hn_frame_bank_path)
+        eps = batch["episode_index"].tolist()
+        ts = batch["task_index"].tolist()
+        frames = []
+        for ep, t in zip(eps, ts):
+            if self.config.hn_frame_source == "same":
+                frames.append(self._frame_bank.same(int(ep), self._bank_gen))
+            else:
+                frames.append(self._frame_bank.cross(int(t), int(ep), self._bank_gen))
+        img = torch.stack(frames).to(next(self.parameters()).device)
+        out = dict(batch)
+        for k in list(out):
+            if k.startswith("observation.image"):
+                out[k] = img
+        return out
+
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:
         # At eval, optionally reuse a per-episode adapter to break the
         # vision-conditioned feedback loop (see config.hn_lora_cache_eval).
@@ -273,15 +311,22 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         with torch.set_grad_enabled(self.training):
             text_embeds = self._embed_language(lang_tokens)
 
+        # Init-frame pairing ablation: at TRAIN time swap the conditioning images
+        # for the paired t=0 frame (same/cross). The default "obs" path leaves
+        # cond_batch == batch, so vision behavior is bit-for-bit unchanged.
+        cond_batch = batch
+        if self.training and getattr(self.config, "hn_frame_source", "obs") != "obs":
+            cond_batch = self._bank_batch(batch)
+
         # Vision conditioning inputs come from frozen encoders, so compute them
         # under no_grad (cheaper); the hypernet still trains via the LoRA path.
         vlm_vision_embeds = None
         dino_embeds = None
         with torch.no_grad():
             if self.config.hn_use_vlm_vision:
-                vlm_vision_embeds = self._vlm_vision_features(batch)
+                vlm_vision_embeds = self._vlm_vision_features(cond_batch)
             if self.config.hn_use_dino:
-                dino_embeds = self._dino_features(batch)
+                dino_embeds = self._dino_features(cond_batch)
 
         weights = self.hypernet(
             text_embeds, lang_masks, vlm_vision_embeds, dino_embeds

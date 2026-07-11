@@ -27,14 +27,21 @@
 #   PREC       (bf16)                 bf16 | no (fp32)
 #   DINO_ID    (facebook/dinov2-base) external vision encoder (vision mode)
 #   ENC        (dino)                traj clip encoder: dino | vjepa2
-#   FRAMES     (4)                   traj clip length (vjepa2: use 16, even)
 #   XPAIR_CACHE (outputs/xpair_cache/$ENC)  traj-clip cache dir (traj mode; build
 #                                     it first with scripts/build_xpair_cache.py
-#                                     --encoder $ENC --num_frames $FRAMES)
+#                                     --encoder $ENC)
 #   KV         (0)                    1 = also inject LoRA at the VLM k/v routing
 #                                     site (traj mode)
-#   TRAIN_K    (1)                   traj mode: concat up to K same-task demos per
-#                                     train sample (match eval retrieval; try 3)
+#   PAIR       (loo)                 conditioning pair mode, shared by two modes:
+#                                     traj (->hn_pair_mode):    same | loo (leave-one-out)
+#                                     vision (->hn_frame_source): obs | same | cross.
+#                                     Unset (or the traj default "loo") maps to obs =
+#                                     legacy current-observation conditioning.
+#   K          (8)                   traj mode: number of context demos per sample
+#   BANK       (outputs/frame_bank.npz)  vision mode, PAIR=same|cross: first-frame
+#                                     bank path (build with the frame-bank script)
+#   VLM        (1)                   vision mode: 1 = condition HN on the VLM's own
+#                                     image tokens; 0 = no VLA embedding (arm A3/A4)
 #   WANDB      (1)                    1 = enable wandb logging
 #   WANDB_PROJECT (hyper-lora)        wandb project name
 
@@ -55,10 +62,12 @@ SAVE_FREQ="${SAVE_FREQ:-25000}"
 PREC="${PREC:-bf16}"
 DINO_ID="${DINO_ID:-facebook/dinov2-base}"
 ENC="${ENC:-dino}"
-FRAMES="${FRAMES:-4}"
 XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/$ENC}"
 KV="${KV:-0}"
-TRAIN_K="${TRAIN_K:-1}"
+PAIR="${PAIR:-loo}"
+K="${K:-8}"
+BANK="${BANK:-outputs/frame_bank.npz}"
+VLM="${VLM:-1}"
 [ "$KV" = "1" ] && KV_FLAG=true || KV_FLAG=false
 export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "${WANDB:-1}" = "1" ] && WANDB_FLAG=true || WANDB_FLAG=false
@@ -105,14 +114,21 @@ python -c "from src.data.libero import prefetch_all_data_parquets as p; p()"
 MODE_ARGS=()
 case "$MODE" in
     vision)
+        # PAIR serves both modes: for vision, obs (legacy) is the default, so an
+        # unset PAIR (or the traj default "loo") maps to obs. PAIR=same|cross pick
+        # the init-frame ablation arms; only those pass a frame-bank path.
+        vpair=$PAIR
+        [ "$vpair" = "loo" ] && vpair=obs
         MODE_ARGS+=(
             --policy.type=hyper_lora_smolvla
-            --policy.hn_use_vlm_vision=true
+            --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
+            --policy.hn_frame_source="$vpair"
             --policy.hn_use_dino=true
             --policy.hn_dino_model_id="$DINO_ID"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"
-        ) ;;
+        )
+        [ "$vpair" != "obs" ] && MODE_ARGS+=(--policy.hn_frame_bank_path="$BANK") ;;
     text)
         MODE_ARGS+=(
             --policy.type=hyper_lora_smolvla
@@ -142,8 +158,8 @@ case "$MODE" in
             --policy.hn_use_traj_clip=true
             --policy.hn_xpair_cache_path="$XPAIR_CACHE"
             --policy.hn_traj_encoder="$ENC"
-            --policy.hn_traj_num_frames="$FRAMES"
-            --policy.hn_train_k="$TRAIN_K"
+            --policy.hn_pair_mode="$PAIR"
+            --policy.hn_context_k="$K"
             --policy.hn_inject_vlm_kv="$KV_FLAG"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"

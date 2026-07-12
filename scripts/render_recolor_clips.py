@@ -172,12 +172,15 @@ def _detect_flip(env, state0: np.ndarray, ref_hwc: np.ndarray) -> tuple[bool, fl
     return mae_fl < mae_up, min(mae_up, mae_fl)
 
 
-def _contact_sheet(out_dir: Path, max_tiles: int = 12) -> None:
+def _contact_sheet(out_dir: Path, max_tiles: int = 12, suffix: str = "") -> None:
     import imageio.v2 as imageio
 
     tiles = []
     for path in sorted(out_dir.glob("ep*.npz"))[:max_tiles]:
-        tiles.append(np.load(path)["frames"][0])
+        try:                                           # skip a peer shard's half-written npz
+            tiles.append(np.load(path)["frames"][0])
+        except Exception:
+            continue
     if not tiles:
         return
     cols = 4
@@ -187,7 +190,7 @@ def _contact_sheet(out_dir: Path, max_tiles: int = 12) -> None:
     for i, t in enumerate(tiles):
         r, cc = divmod(i, cols)
         sheet[r * h:(r + 1) * h, cc * w:(cc + 1) * w] = t
-    imageio.imwrite(out_dir / "contact_sheet.png", sheet)
+    imageio.imwrite(out_dir / f"contact_sheet{suffix}.png", sheet)
 
 
 def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
@@ -358,9 +361,10 @@ def main(argv=None):  # pragma: no cover (GPU/EGL + datasets)
                     done += 1
             env.close()
 
-    _contact_sheet(out_dir)
+    sheet_suffix = f"_shard{args.shard}" if args.num_shards > 1 else ""
+    _contact_sheet(out_dir, suffix=sheet_suffix)
     print(f"rendered {done} clips to {out_dir} ({skipped} skipped); "
-          f"inspect {out_dir}/contact_sheet.png")
+          f"inspect {out_dir}/contact_sheet{sheet_suffix}.png")
 
 
 if __name__ == "__main__":  # pragma: no cover

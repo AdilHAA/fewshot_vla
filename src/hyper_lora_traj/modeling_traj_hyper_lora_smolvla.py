@@ -186,18 +186,44 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         return traj.to(dev), mask.to(dev), marks.to(dev)
 
     def _resolve_eval_task(self, batch: Dict[str, Tensor]) -> int:
-        """Base-task lookup: batch task_index when present, else the decoded
-        instruction matched against the cache's task_texts."""
+        """Base-task lookup: batch task_index when present, else the instruction
+        (raw string key, or decoded tokens) matched against the cache's task_texts."""
         v = batch.get("task_index") if isinstance(batch, dict) else None
         if v is not None:
             return int(v.flatten()[0]) if hasattr(v, "flatten") else int(v)
+        # Raw instruction string — the env usually exposes it under "task".
         text = ""
-        tok = getattr(getattr(self, "language_tokenizer", None), "decode", None)
-        if tok is not None and OBS_LANGUAGE_TOKENS in batch:
-            text = self.language_tokenizer.decode(
-                batch[OBS_LANGUAGE_TOKENS][0], skip_special_tokens=True)
+        for key in ("task", "instruction", "language_instruction", "prompt"):
+            t = batch.get(key) if isinstance(batch, dict) else None
+            if isinstance(t, (list, tuple)) and t:
+                t = t[0]
+            if isinstance(t, str) and t:
+                text = t
+                break
+        # Fall back to decoding the tokenized instruction with a lazily-built tokenizer.
+        if not text and isinstance(batch, dict) and OBS_LANGUAGE_TOKENS in batch:
+            text = self._decode_instruction(batch[OBS_LANGUAGE_TOKENS][0])
         ti = self._traj_cache.resolve_task(text)
         if ti is None:
-            raise RuntimeError(f"cannot resolve eval task from instruction {text!r}; "
-                               f"pass task_index or extend the cache task_texts")
+            keys = sorted(batch.keys()) if isinstance(batch, dict) else type(batch).__name__
+            raise RuntimeError(f"cannot resolve eval task; instruction={text!r}, "
+                               f"batch keys={keys}; pass task_index or extend task_texts")
         return ti
+
+    def _decode_instruction(self, token_ids) -> str:
+        """Decode OBS_LANGUAGE_TOKENS via a tokenizer loaded from the VLM (cached).
+        The policy holds no tokenizer of its own, so build one on first eval use."""
+        if getattr(self, "_lang_tok", None) is None:
+            from transformers import AutoTokenizer
+
+            vlm_id = (getattr(self.config, "vlm_model_name", None)
+                      or getattr(self.config, "load_vlm_weights_from", None)
+                      or "HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+            try:
+                self._lang_tok = AutoTokenizer.from_pretrained(vlm_id)
+            except Exception as e:               # decode is best-effort; task key usually wins
+                logger.warning("could not load tokenizer %s for eval task decode: %s", vlm_id, e)
+                self._lang_tok = False
+        if not self._lang_tok:
+            return ""
+        return self._lang_tok.decode(token_ids, skip_special_tokens=True).strip()

@@ -176,9 +176,14 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             return traj.to(dev), mask.to(dev), marks.to(dev)
         # EVAL: every env in a rollout batch runs the same suite task -> one lookup,
         # deterministic demo pick, expanded across the env batch.
+        # Context size must match what the HN consumed at train time: a same-trained
+        # HN only ever saw ONE demo per sample; feeding it k>1 concatenated demos is
+        # out-of-distribution input and yields garbage adapters.
         task_index = self._resolve_eval_task(batch)
+        k = 1 if getattr(self.config, "hn_pair_mode", "loo") == "same" \
+            else self.config.hn_context_k
         demos = select_eval_conditioning(
-            self._traj_cache, task_index, self.config.hn_context_k, self.config.hn_seed)
+            self._traj_cache, task_index, k, self.config.hn_seed)
         bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
         traj, mask, marks = pack_conditioning([demos] * bsz)
         logger.warning("[TRAJ] task=%d demos=%d tokens=%d",
@@ -204,6 +209,13 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         if not text and isinstance(batch, dict) and OBS_LANGUAGE_TOKENS in batch:
             text = self._decode_instruction(batch[OBS_LANGUAGE_TOKENS][0])
         ti = self._traj_cache.resolve_task(text)
+        if ti is None:
+            # Novel-instruction suites (e.g. the _task axis) legitimately miss the
+            # cutoff — condition on the nearest known task instead of crashing.
+            ti = self._traj_cache.nearest_task(text)
+            if ti is not None:
+                logger.warning("[TRAJ] instruction %r matched no cached task; "
+                               "falling back to nearest task %d", text, ti)
         if ti is None:
             keys = sorted(batch.keys()) if isinstance(batch, dict) else type(batch).__name__
             raise RuntimeError(f"cannot resolve eval task; instruction={text!r}, "

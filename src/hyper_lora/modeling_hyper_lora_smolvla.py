@@ -277,8 +277,11 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         )
 
     def _bank_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """Swap every image key for the pairing frame (t=0 of the imitated episode for
-        'same', of another same-task episode for 'cross'). Text/action keys untouched."""
+        """Swap the MAIN camera for the pairing frame (t=0 of the imitated episode for
+        'same', of another same-task episode for 'cross'). Other camera views and
+        text/action keys stay real: the bank stores agentview frames only, and
+        duplicating one into the wrist slot would give the conditioning encoders a
+        train-time input distribution that never occurs at eval."""
         if self._frame_bank is None:
             from src.traj_data.frame_bank import FrameBank
 
@@ -293,9 +296,8 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
                 frames.append(self._frame_bank.cross(int(t), int(ep), self._bank_gen))
         img = torch.stack(frames).to(next(self.parameters()).device)
         out = dict(batch)
-        for k in list(out):
-            if k.startswith("observation.image"):
-                out[k] = img
+        key = next(k for k in self.config.image_features if k in out)  # == _first_image
+        out[key] = img
         return out
 
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:

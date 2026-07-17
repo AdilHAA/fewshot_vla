@@ -53,3 +53,12 @@ class TrajCache:
             return self._text_to_task[n]
         hit = difflib.get_close_matches(n, list(self._text_to_task), n=1, cutoff=0.6)
         return self._text_to_task[hit[0]] if hit else None
+
+    def nearest_task(self, text: str):
+        """Best-effort fallback: the closest task text with no cutoff (for novel
+        instructions that legitimately match nothing). None only on an empty cache."""
+        if not self._text_to_task:
+            return None
+        hit = difflib.get_close_matches(norm_text(text), list(self._text_to_task),
+                                        n=1, cutoff=0.0)
+        return self._text_to_task[hit[0]] if hit else None

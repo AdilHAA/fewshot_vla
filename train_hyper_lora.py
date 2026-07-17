@@ -18,6 +18,7 @@ checkpoint's config.json and inject them so the skeleton matches the base
 state_dict. Explicit CLI flags win; resuming a checkpoint skips injection.
 """
 
+import os
 import sys
 
 import src.hyper_lora  # noqa: F401 — registers the hyper_lora_smolvla policy type
@@ -25,6 +26,26 @@ import src.hyper_lora_traj  # noqa: F401 — registers the traj_hyper_lora_smolv
 from src.hyper_lora import HyperLoRASmolVLAConfig
 from src.hyper_lora.base_config import base_config_overrides
 from lerobot.scripts.lerobot_train import main
+
+
+class _TensorBoardLogger:
+    """Drop-in for lerobot's WandBLogger writing scalars to TensorBoard instead.
+    Enabled with env TENSORBOARD=1 (train.sh TB=1); needs no network or login.
+    View with: tensorboard --logdir <output_dir>/tensorboard"""
+
+    def __init__(self, cfg):
+        from torch.utils.tensorboard import SummaryWriter
+
+        self._writer = SummaryWriter(log_dir=os.path.join(str(cfg.output_dir), "tensorboard"))
+
+    def log_dict(self, d, step, mode="train"):
+        for k, v in d.items():
+            if isinstance(v, (int, float)):
+                self._writer.add_scalar(f"{mode}/{k}", v, step)
+        self._writer.flush()
+
+    def __getattr__(self, name):  # log_policy/log_video/...: ignore quietly
+        return lambda *a, **k: None
 
 
 def _inject_base_config_overrides() -> None:
@@ -55,4 +76,11 @@ def _inject_base_config_overrides() -> None:
 
 if __name__ == "__main__":
     _inject_base_config_overrides()
+    if os.environ.get("TENSORBOARD") == "1":
+        # The train loop instantiates whatever `WandBLogger` names in its module
+        # namespace; rebinding it routes all metric logging to TensorBoard without
+        # touching lerobot (wandb is never imported).
+        import lerobot.scripts.lerobot_train as _lt
+
+        _lt.WandBLogger = _TensorBoardLogger
     main()

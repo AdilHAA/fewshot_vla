@@ -46,6 +46,9 @@
 #   WANDB_PROJECT (hyper-lora)        wandb project name
 #   WANDB_OFFLINE (0)                 1 = log wandb locally without network/login
 #                                     (later: `wandb sync wandb/offline-*`)
+#   TB         (0)                    1 = log scalars to TensorBoard instead of wandb
+#                                     (no network/login; view with
+#                                     `tensorboard --logdir $OUTPUT/tensorboard`)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -77,6 +80,9 @@ export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "$EXPERT" = "1" ] && EXPERT_FLAG=true || EXPERT_FLAG=false
 WANDB_PROJECT="${WANDB_PROJECT:-hyper-lora}"
 [ "${WANDB_OFFLINE:-0}" = "1" ] && export WANDB_MODE=offline
+# TB=1 substitutes the logger class inside train_hyper_lora.py; the wandb enable
+# flag must be true so the train loop instantiates a logger at all.
+[ "${TB:-0}" = "1" ] && { WANDB_FLAG=true; export TENSORBOARD=1; }
 
 case "$MODE" in
     vision) DEFAULT_OUTPUT="outputs/hyper_lora_vision"; BATCH="${BATCH:-16}" ;;

@@ -8,6 +8,7 @@ huggingface-hub
 accelerate
 peft>=0.10.0
 wandb
+tensorboard
 
 # lerobot — provides SmolVLAPolicy, LeRobotDataset, processors
 lerobot==0.5.1  # 0.6+ needs av.option (breaks on new PyAV) and changes dataset APIs

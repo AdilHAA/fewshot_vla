@@ -44,6 +44,8 @@
 #                                     image tokens; 0 = no VLA embedding (arm A3/A4)
 #   WANDB      (1)                    1 = enable wandb logging
 #   WANDB_PROJECT (hyper-lora)        wandb project name
+#   WANDB_OFFLINE (0)                 1 = log wandb locally without network/login
+#                                     (later: `wandb sync wandb/offline-*`)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -74,6 +76,7 @@ export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "$AUG" = "1" ] && AUG_FLAG=true || AUG_FLAG=false
 [ "$EXPERT" = "1" ] && EXPERT_FLAG=true || EXPERT_FLAG=false
 WANDB_PROJECT="${WANDB_PROJECT:-hyper-lora}"
+[ "${WANDB_OFFLINE:-0}" = "1" ] && export WANDB_MODE=offline
 
 case "$MODE" in
     vision) DEFAULT_OUTPUT="outputs/hyper_lora_vision"; BATCH="${BATCH:-16}" ;;

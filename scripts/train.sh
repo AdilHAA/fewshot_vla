@@ -132,6 +132,7 @@ case "$MODE" in
             --policy.type=hyper_lora_smolvla
             --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
             --policy.hn_frame_source="$vpair"
+            --policy.hn_context_k="$K"
             --policy.hn_use_dino=true
             --policy.hn_dino_model_id="$DINO_ID"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))

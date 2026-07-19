@@ -276,29 +276,48 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
             "[HN] step=%d lora_norm=%.4f step_drift=%.4f", self._lora_step, flat.norm().item(), drift
         )
 
-    def _bank_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """Swap the MAIN camera for the pairing frame (t=0 of the imitated episode for
-        'same', of another same-task episode for 'cross'). Other camera views and
-        text/action keys stay real: the bank stores agentview frames only, and
-        duplicating one into the wrist slot would give the conditioning encoders a
-        train-time input distribution that never occurs at eval."""
+    def _ensure_bank(self) -> None:
         if self._frame_bank is None:
             from src.traj_data.frame_bank import FrameBank
 
             self._frame_bank = FrameBank(self.config.hn_frame_bank_path)
-        eps = batch["episode_index"].tolist()
-        ts = batch["task_index"].tolist()
-        frames = []
-        for ep, t in zip(eps, ts):
-            if self.config.hn_frame_source == "same":
-                frames.append(self._frame_bank.same(int(ep), self._bank_gen))
-            else:
-                frames.append(self._frame_bank.cross(int(t), int(ep), self._bank_gen))
-        img = torch.stack(frames).to(next(self.parameters()).device)
+
+    def _swap_main(self, batch: Dict[str, Tensor], img: Tensor) -> Dict[str, Tensor]:
+        """Batch copy with the MAIN camera replaced by `img` (B,C,H,W). Other views
+        and text/action keys stay real: the bank stores agentview frames only, and
+        duplicating one into the wrist slot would give the conditioning encoders a
+        train-time input distribution that never occurs at eval."""
         out = dict(batch)
         key = next(k for k in self.config.image_features if k in out)  # == _first_image
-        out[key] = img
+        out[key] = img.to(next(self.parameters()).device)
         return out
+
+    def _bank_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """'same' conditioning: the t=0 frame of the imitated episode itself."""
+        self._ensure_bank()
+        frames = [self._frame_bank.same(int(ep), self._bank_gen)
+                  for ep in batch["episode_index"].tolist()]
+        return self._swap_main(batch, torch.stack(frames))
+
+    def _bank_frame_sets(self, batch: Dict[str, Tensor]) -> list:
+        """'cross' conditioning: k_step ~ U{1..hn_context_k} t=0 frames from DISTINCT
+        other episodes of the same task ("frames of different trajectories"). One
+        k_step per batch keeps the vision-token count uniform across samples.
+        Returns k_step stacks of (B,C,H,W)."""
+        self._ensure_bank()
+        kmax = int(getattr(self.config, "hn_context_k", 8))
+        k_step = (1 + int(torch.randint(kmax, (1,), generator=self._bank_gen).item())
+                  if kmax > 1 else 1)
+        per_sample = [self._frame_bank.cross_set(int(t), int(ep), self._bank_gen, k_step)
+                      for ep, t in zip(batch["episode_index"].tolist(),
+                                       batch["task_index"].tolist())]
+        return [torch.stack([s[i] for s in per_sample]) for i in range(k_step)]
+
+    def _main_token_slice(self, toks: Tensor, batch: Dict[str, Tensor]) -> Tensor:
+        """Tokens of the main camera only (first in prepare_images order): extra bank
+        frames must not re-contribute duplicate wrist tokens."""
+        n_cams = sum(1 for k in self.config.image_features if k in batch)
+        return toks[:, : toks.shape[1] // max(n_cams, 1)]
 
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:
         # At eval, optionally reuse a per-episode adapter to break the
@@ -313,22 +332,39 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         with torch.set_grad_enabled(self.training):
             text_embeds = self._embed_language(lang_tokens)
 
-        # Init-frame pairing ablation: at TRAIN time swap the conditioning images
-        # for the paired t=0 frame (same/cross). The default "obs" path leaves
+        # Init-frame pairing ablation: at TRAIN time swap the conditioning images.
+        # 'same' = the imitated episode's own t=0 frame; 'cross' = k t=0 frames from
+        # distinct other episodes of the task. The default "obs" path leaves
         # cond_batch == batch, so vision behavior is bit-for-bit unchanged.
         cond_batch = batch
+        extra_frames = []
         if self.training and getattr(self.config, "hn_frame_source", "obs") != "obs":
-            cond_batch = self._bank_batch(batch)
+            if self.config.hn_frame_source == "cross":
+                sets = self._bank_frame_sets(batch)
+                cond_batch = self._swap_main(batch, sets[0])
+                extra_frames = sets[1:]
+            else:
+                cond_batch = self._bank_batch(batch)
 
         # Vision conditioning inputs come from frozen encoders, so compute them
         # under no_grad (cheaper); the hypernet still trains via the LoRA path.
+        # Frames beyond the first contribute only their main-camera tokens.
         vlm_vision_embeds = None
         dino_embeds = None
         with torch.no_grad():
             if self.config.hn_use_vlm_vision:
                 vlm_vision_embeds = self._vlm_vision_features(cond_batch)
+                if extra_frames:
+                    extras = [self._main_token_slice(
+                        self._vlm_vision_features(self._swap_main(batch, f)), batch)
+                        for f in extra_frames]
+                    vlm_vision_embeds = torch.cat([vlm_vision_embeds] + extras, dim=1)
             if self.config.hn_use_dino:
                 dino_embeds = self._dino_features(cond_batch)
+                if extra_frames:
+                    extras = [self._dino_features(self._swap_main(batch, f))
+                              for f in extra_frames]
+                    dino_embeds = torch.cat([dino_embeds] + extras, dim=1)
 
         weights = self.hypernet(
             text_embeds, lang_masks, vlm_vision_embeds, dino_embeds

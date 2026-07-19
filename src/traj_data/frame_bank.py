@@ -41,8 +41,20 @@ class FrameBank:
 
     def cross(self, task_index: int, exclude_episode: int, g: torch.Generator,
               p_orig: float = 0.5) -> torch.Tensor:
-        pool = [i for i in self._by_task.get(int(task_index), [])
-                if int(self.episode[i]) != int(exclude_episode)]
-        if not pool:
-            return self.same(exclude_episode, g, p_orig)
-        return self._img(self._pick(pool, g, p_orig))
+        return self.cross_set(task_index, exclude_episode, g, 1, p_orig)[0]
+
+    def cross_set(self, task_index: int, exclude_episode: int, g: torch.Generator,
+                  k: int, p_orig: float = 0.5) -> list:
+        """k t=0 frames from k DISTINCT other episodes of the task (repeats only when
+        fewer exist; single-episode tasks fall back to the episode itself)."""
+        eps = sorted({int(self.episode[i])
+                      for i in self._by_task.get(int(task_index), [])
+                      if int(self.episode[i]) != int(exclude_episode)})
+        if not eps:
+            return [self.same(exclude_episode, g, p_orig) for _ in range(k)]
+        if len(eps) >= k:
+            perm = torch.randperm(len(eps), generator=g).tolist()
+            chosen = [eps[i] for i in perm[:k]]
+        else:
+            chosen = [eps[_choice(len(eps), g)] for _ in range(k)]
+        return [self._img(self._pick(self._by_ep[e], g, p_orig)) for e in chosen]

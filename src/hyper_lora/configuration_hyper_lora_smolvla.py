@@ -70,3 +70,4 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     hn_frame_source: str = "obs"
     hn_frame_bank_path: str | None = None
     hn_bank_seed: int = 42
+    hn_context_k: int = 8    # cross: max t=0 frames from distinct other episodes

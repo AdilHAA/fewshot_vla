@@ -34,8 +34,8 @@ def pack_conditioning(samples):
 def select_train_conditioning(cache, episode_idx, task_idx, pair_mode: str,
                               k: int, generator: torch.Generator):
     """pair_mode='same': a random variant of the imitated episode itself.
-    pair_mode='loo': k_step~U{1..k} same-task demos EXCLUDING the imitated episode
-    (any variant, no repeats while the pool allows); resampled every call.
+    pair_mode='loo': ALWAYS k same-task demos EXCLUDING the imitated episode
+    (fewer only when the pool is smaller — no repeats); resampled every call.
     Single-episode tasks fall back to 'same'."""
     samples = []
     for b in range(len(episode_idx)):
@@ -46,12 +46,9 @@ def select_train_conditioning(cache, episode_idx, task_idx, pair_mode: str,
         if pair_mode == "same" or not other:
             sel = [own[_choice(len(own), generator)]]
         else:
-            k_step = 1 + _choice(k, generator) if k > 1 else 1
-            if len(other) >= k_step:
-                perm = torch.randperm(len(other), generator=generator).tolist()
-                sel = [other[i] for i in perm[:k_step]]
-            else:
-                sel = [other[_choice(len(other), generator)] for _ in range(k_step)]
+            k_step = min(k, len(other))
+            perm = torch.randperm(len(other), generator=generator).tolist()
+            sel = [other[i] for i in perm[:k_step]]
         samples.append([cache.read_row(r) for r in sel])
     return pack_conditioning(samples)
 

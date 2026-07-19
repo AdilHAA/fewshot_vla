@@ -43,6 +43,12 @@ class FrameBank:
               p_orig: float = 0.5) -> torch.Tensor:
         return self.cross_set(task_index, exclude_episode, g, 1, p_orig)[0]
 
+    def n_cross(self, task_index: int, exclude_episode: int) -> int:
+        """How many DISTINCT other episodes the task has (cross pool size)."""
+        return len({int(self.episode[i])
+                    for i in self._by_task.get(int(task_index), [])
+                    if int(self.episode[i]) != int(exclude_episode)})
+
     def cross_set(self, task_index: int, exclude_episode: int, g: torch.Generator,
                   k: int, p_orig: float = 0.5) -> list:
         """k t=0 frames from k DISTINCT other episodes of the task (repeats only when

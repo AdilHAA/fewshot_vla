@@ -300,17 +300,19 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         return self._swap_main(batch, torch.stack(frames))
 
     def _bank_frame_sets(self, batch: Dict[str, Tensor]) -> list:
-        """'cross' conditioning: k_step ~ U{1..hn_context_k} t=0 frames from DISTINCT
-        other episodes of the same task ("frames of different trajectories"). One
+        """'cross' conditioning: ALWAYS hn_context_k t=0 frames from DISTINCT other
+        episodes of the same task ("frames of different trajectories"); fewer only
+        when some task in the batch has a smaller pool (no repeat-padding). One
         k_step per batch keeps the vision-token count uniform across samples.
         Returns k_step stacks of (B,C,H,W)."""
         self._ensure_bank()
         kmax = int(getattr(self.config, "hn_context_k", 8))
-        k_step = (1 + int(torch.randint(kmax, (1,), generator=self._bank_gen).item())
-                  if kmax > 1 else 1)
+        pairs = list(zip(batch["episode_index"].tolist(), batch["task_index"].tolist()))
+        avail = [self._frame_bank.n_cross(int(t), int(ep)) for ep, t in pairs]
+        k_step = (min([kmax] + [a for a in avail if a > 0])
+                  if any(a > 0 for a in avail) else 1)
         per_sample = [self._frame_bank.cross_set(int(t), int(ep), self._bank_gen, k_step)
-                      for ep, t in zip(batch["episode_index"].tolist(),
-                                       batch["task_index"].tolist())]
+                      for ep, t in pairs]
         return [torch.stack([s[i] for s in per_sample]) for i in range(k_step)]
 
     def _main_token_slice(self, toks: Tensor, batch: Dict[str, Tensor]) -> Tensor:
@@ -338,6 +340,11 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         # cond_batch == batch, so vision behavior is bit-for-bit unchanged.
         cond_batch = batch
         extra_frames = []
+        rep_k = 0
+        if getattr(self.config, "hn_frame_source", "obs") == "cross" and not self.training:
+            # cross-trained HN always consumed hn_context_k frames; replicate the
+            # rollout's single t=0 frame to match the train-time token count.
+            rep_k = int(getattr(self.config, "hn_context_k", 8)) - 1
         if self.training and getattr(self.config, "hn_frame_source", "obs") != "obs":
             if self.config.hn_frame_source == "cross":
                 sets = self._bank_frame_sets(batch)
@@ -359,12 +366,17 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
                         self._vlm_vision_features(self._swap_main(batch, f)), batch)
                         for f in extra_frames]
                     vlm_vision_embeds = torch.cat([vlm_vision_embeds] + extras, dim=1)
+                elif rep_k > 0:
+                    ms = self._main_token_slice(vlm_vision_embeds, batch)
+                    vlm_vision_embeds = torch.cat([vlm_vision_embeds] + [ms] * rep_k, dim=1)
             if self.config.hn_use_dino:
                 dino_embeds = self._dino_features(cond_batch)
                 if extra_frames:
                     extras = [self._dino_features(self._swap_main(batch, f))
                               for f in extra_frames]
                     dino_embeds = torch.cat([dino_embeds] + extras, dim=1)
+                elif rep_k > 0:
+                    dino_embeds = torch.cat([dino_embeds] * (rep_k + 1), dim=1)
 
         weights = self.hypernet(
             text_embeds, lang_masks, vlm_vision_embeds, dino_embeds

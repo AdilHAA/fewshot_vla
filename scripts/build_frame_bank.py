@@ -46,6 +46,7 @@ def main(argv=None):  # pragma: no cover (dataset)
         tags = sorted({c for lst in rendered.values() for c, _ in lst})
 
     images, episode, task_index, variant = [], [], [], []
+    task_texts = {}
     acc = 0
     for ep in range(ds.meta.total_episodes):
         row = _erow(ep)
@@ -56,15 +57,19 @@ def main(argv=None):  # pragma: no cover (dataset)
         item = ds[start]
         img = (item[img_key].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         ti = int(item["task_index"])
+        task_texts.setdefault(ti, item.get("task", ""))
         images.append(img); episode.append(ep); task_index.append(ti); variant.append(0)
         for tag, path in rendered.get(ep, []):
             with np.load(path) as z:
                 images.append(z["frames"][0])
             episode.append(ep); task_index.append(ti); variant.append(1 + tags.index(tag))
 
+    import json
+
     np.savez_compressed(args.out, images=np.stack(images),
                         episode=np.array(episode), task_index=np.array(task_index),
-                        variant=np.array(variant))
+                        variant=np.array(variant),
+                        task_texts_json=json.dumps(task_texts))
     print(f"wrote {len(images)} first frames to {args.out}")
 
 

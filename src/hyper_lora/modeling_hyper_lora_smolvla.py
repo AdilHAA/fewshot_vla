@@ -321,6 +321,35 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         n_cams = sum(1 for k in self.config.image_features if k in batch)
         return toks[:, : toks.shape[1] // max(n_cams, 1)]
 
+    def _bank_eval_sets(self, batch: Dict[str, Tensor]):
+        """Eval few-shot context for 'cross': resolve the task (batch task_index, then
+        the instruction string) and return hn_context_k deterministic bank frames of
+        its train episodes, expanded across envs. None when unresolvable."""
+        self._ensure_bank()
+        ti = batch.get("task_index") if isinstance(batch, dict) else None
+        if ti is not None:
+            ti = int(ti.flatten()[0]) if hasattr(ti, "flatten") else int(ti)
+        else:
+            text = ""
+            for key in ("task", "instruction", "language_instruction", "prompt"):
+                t = batch.get(key) if isinstance(batch, dict) else None
+                if isinstance(t, (list, tuple)) and t:
+                    t = t[0]
+                if isinstance(t, str) and t:
+                    text = t
+                    break
+            ti = self._frame_bank.resolve_task(text) if text else None
+        if ti is None:
+            return None
+        frames = self._frame_bank.task_set(
+            ti, int(getattr(self.config, "hn_context_k", 8)),
+            int(getattr(self.config, "hn_bank_seed", 42)))
+        if not frames:
+            return None
+        bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
+        dev = next(self.parameters()).device
+        return [f.unsqueeze(0).expand(bsz, -1, -1, -1).to(dev) for f in frames]
+
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:
         # At eval, optionally reuse a per-episode adapter to break the
         # vision-conditioned feedback loop (see config.hn_lora_cache_eval).
@@ -342,9 +371,16 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         extra_frames = []
         rep_k = 0
         if getattr(self.config, "hn_frame_source", "obs") == "cross" and not self.training:
-            # cross-trained HN always consumed hn_context_k frames; replicate the
-            # rollout's single t=0 frame to match the train-time token count.
-            rep_k = int(getattr(self.config, "hn_context_k", 8)) - 1
+            # cross-trained HN always consumed hn_context_k frames. Preferred: resolve
+            # the task and feed k bank frames of its TRAIN episodes (format == train).
+            # Fallback (bank has no task_texts / unresolvable): replicate the rollout
+            # frame to match the train-time token count.
+            sets = self._bank_eval_sets(batch)
+            if sets:
+                cond_batch = self._swap_main(batch, sets[0])
+                extra_frames = sets[1:]
+            else:
+                rep_k = int(getattr(self.config, "hn_context_k", 8)) - 1
         if self.training and getattr(self.config, "hn_frame_source", "obs") != "obs":
             if self.config.hn_frame_source == "cross":
                 sets = self._bank_frame_sets(batch)

@@ -128,32 +128,17 @@ EPISODE_CACHE=1 POLICIES="my_run=outputs/my_run/checkpoints/last/pretrained_mode
 ```
 
 Результаты: `outputs/eval_matrix/<label>/<suite>/seed_<s>/eval_info.json`
-(`overall.pc_success`), сводная таблица печатается в конце eval.sh.
+(`overall.pc_success`), сводная таблица печатается в конце eval.sh. Рядом же сохраняются видео с симулятора
 Логи обучения: `TB=1` → TensorBoard в `$OUTPUT/tensorboard` (без сети), либо
 `WANDB_OFFLINE=1`.
 
 **Возможное падение на импорте из-за torchaudio.** Если запуск валится с
-`OSError: libcudart.so.XX: cannot open shared object file` и в трейсбеке фигурирует
-`torchaudio` — это несовпадение CUDA-сборок torch и torchaudio (pip легко ставит их
-от разных версий CUDA). Проект torchaudio **не использует**, он лишь тянется
-транзитивно и ломает импорт-цепочку — просто удалите его:
+`OSError: libcudart.so.XX: cannot open shared object file` надо удалить torchaudio:
 
 ```bash
 pip uninstall -y torchaudio
 ```
 
-После любого обновления/переустановки torch проверяйте, что он не вернулся.
+## FYI
+Пока забейте и не смотрите на код связанный с ретривалом/кондишенингом траекторий целых, там буду переделывать
 
-## Частые вопросы
-
-- **Почему два класса политик?** `traj_hyper_lora_smolvla` наследует
-  `hyper_lora_smolvla`; с выключенными флагами структурно идентичен ему, так что
-  traj-стек не трогает text/vision-код и чекпоинты.
-- **Почему кеш ragged?** Демо разной длины; конкат токенов одним mmap +
-  (offset, length) на запись — ленивое чтение без паддинга на диске.
-- **Откуда HN знает текст?** Токенизация и эмбеддинг — от самого VLM (общие с
-  политикой), HN учит только проекцию в своё скрытое пространство.
-- **Диагностика:** `[TRAJ] task=...` в eval-логе — резолв задачи и подгрузка демо;
-  `HN_LOG_LORA=1` — норма/дрейф генерируемых весов; при «зависании» после
-  «Creating policy» смотрите `nvidia-smi` и `py-spy dump` (типично: wandb без сети
-  или гонка HF-кеша при параллельных стартах).

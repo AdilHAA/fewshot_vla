@@ -86,10 +86,6 @@ git clone <repo> && cd fewshot_vla
 bash scripts/setup.sh
 ```
 
-Версии в `requirements.txt` запинены не случайно — каждый пин закреплён после
-реального падения (`lerobot==0.5.1`, `transformers==5.7.0`, `mujoco<3.3`); не
-обновляйте без проверки. `HF_HUB_OFFLINE=1` несовместим с lerobot 0.5.1.
-Headless-рендер — EGL (выставляется в скриптах).
 
 ## Подготовка данных (нужна только для traj-режима и vision-абляций)
 

@@ -132,6 +132,18 @@ EPISODE_CACHE=1 POLICIES="my_run=outputs/my_run/checkpoints/last/pretrained_mode
 Логи обучения: `TB=1` → TensorBoard в `$OUTPUT/tensorboard` (без сети), либо
 `WANDB_OFFLINE=1`.
 
+**Возможное падение на импорте из-за torchaudio.** Если запуск валится с
+`OSError: libcudart.so.XX: cannot open shared object file` и в трейсбеке фигурирует
+`torchaudio` — это несовпадение CUDA-сборок torch и torchaudio (pip легко ставит их
+от разных версий CUDA). Проект torchaudio **не использует**, он лишь тянется
+транзитивно и ломает импорт-цепочку — просто удалите его:
+
+```bash
+pip uninstall -y torchaudio
+```
+
+После любого обновления/переустановки torch проверяйте, что он не вернулся.
+
 ## Частые вопросы
 
 - **Почему два класса политик?** `traj_hyper_lora_smolvla` наследует

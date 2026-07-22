@@ -97,22 +97,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-hyper-lora}"
 [ "${TB:-0}" = "1" ] && { WANDB_FLAG=true; export TENSORBOARD=1; }
 
 case "$MODE" in
-    vision)
-        # PAIR=obs -> legacy conditioning on the current observation (no bank).
-        # PAIR=same|cross -> t=0 bank frame with hn_p_self (1.0 own / 0.0 other
-        # episode of the task), resampled every step.
-        MODE_ARGS+=(
-            --policy.type=hyper_lora_smolvla
-            --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
-            --policy.hn_use_dino=true
-            --policy.hn_dino_model_id="$DINO_ID"
-            --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
-            --policy.train_action_expert="$EXPERT_FLAG"
-        )
-        [ "$PAIR" != "obs" ] && MODE_ARGS+=(
-            --policy.hn_frame_bank_path="$BANK"
-            --policy.hn_p_self="$P_SELF"
-        ) ;;
+    vision) DEFAULT_OUTPUT="outputs/hyper_lora_vision"; BATCH="${BATCH:-16}" ;;
     text)   DEFAULT_OUTPUT="outputs/hyper_lora_text";   BATCH="${BATCH:-32}" ;;
     lora)   DEFAULT_OUTPUT="outputs/lora_baseline";     BATCH="${BATCH:-32}" ;;
     traj)   DEFAULT_OUTPUT="outputs/hyper_lora_traj_$ENC"; BATCH="${BATCH:-32}" ;;

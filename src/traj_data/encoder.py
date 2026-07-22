@@ -20,6 +20,8 @@ def encoder_format(encoder_type: str, vjepa_grid: int = 2) -> str:
     if encoder_type == "dino":
         return "cls"
     if encoder_type == "vjepa2":
+        if int(vjepa_grid) < 1:
+            raise ValueError(f"vjepa_grid must be >= 1, got {vjepa_grid}")
         return f"tubelet_grid{int(vjepa_grid)}"
     raise ValueError(f"unknown encoder_type {encoder_type!r}")
 
@@ -54,6 +56,8 @@ def vjepa2_encode(model, mean, std, frames: torch.Tensor, grid: int = 2) -> torc
     grid×grid block grid (grid=1 reproduces the legacy full mean-pool). Tokens are
     ordered tubelet-major, row-major within the grid."""
     b, t, c, h, w = frames.shape
+    if grid < 1:
+        raise ValueError(f"vjepa2 grid must be >= 1, got {grid}")
     assert t % 2 == 0, "vjepa2 needs an even frame count (tubelet_size=2)"
     x = frames.reshape(b * t, c, h, w)
     x = F.interpolate(x, size=(VJEPA2_SIZE, VJEPA2_SIZE), mode="bilinear", align_corners=False)
@@ -63,8 +67,8 @@ def vjepa2_encode(model, mean, std, frames: torch.Tensor, grid: int = 2) -> torc
     n_tub = t // 2
     n_sp = tok.shape[1] // n_tub
     side = int(n_sp ** 0.5)
-    assert side * side == n_sp and side % grid == 0, \
-        f"spatial map {n_sp} not divisible into a {grid}×{grid} grid"
+    if side * side != n_sp or side % grid != 0:
+        raise ValueError(f"spatial map {n_sp} not divisible into a {grid}×{grid} grid")
     tok = tok.reshape(b, n_tub, grid, side // grid, grid, side // grid, -1)
     tok = tok.mean(dim=(3, 5))                            # (B, n_tub, grid, grid, D)
     return tok.reshape(b, n_tub * grid * grid, -1).to(torch.float16)

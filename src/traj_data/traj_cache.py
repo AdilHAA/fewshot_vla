@@ -36,7 +36,9 @@ class TrajCache:
     def assert_header_matches(self, **expected) -> None:
         for k, v in expected.items():
             got = self.header.get(k)
-            assert got == v, f"cache header.{k}={got} != expected {v}"
+            if got != v:
+                raise ValueError(f"cache header.{k}={got} != expected {v} — "
+                                 f"rebuild the cache for this encoder config")
 
     def read_row(self, row: int) -> torch.Tensor:
         r = self.records[row]

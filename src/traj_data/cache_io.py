@@ -11,7 +11,7 @@ import numpy as np
 @dataclass
 class CacheHeader:
     encoder_id: str        # "dino" | "vjepa2"
-    format: str            # "cls" | "tubelet_meanpool"
+    format: str            # "cls" | "tubelet_grid{s}"
     d_enc: int
     aug_set: str           # provenance tag, e.g. "orig+sim-recolor+cam-jitter"
     num_records: int

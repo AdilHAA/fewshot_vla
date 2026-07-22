@@ -43,8 +43,13 @@ class TrajCache:
         a = np.asarray(self.tokens[r["offset"]:r["offset"] + r["length"]]).copy()
         return torch.from_numpy(a)
 
-    def rows_of_task(self, task_index: int) -> list:
-        return list(self._by_task.get(task_index, []))
+    def rows_of_task(self, task_index: int, originals_only: bool = True) -> list:
+        """Row indices of a task; by default only original recordings (variant==0),
+        excluding sim-augmented variants from the conditioning pool."""
+        rows = self._by_task.get(task_index, [])
+        if originals_only:
+            return [r for r in rows if self.records[r].get("variant", 0) == 0]
+        return list(rows)
 
     def resolve_task(self, text: str):
         """Instruction -> task_index: exact normalized match, then fuzzy (paraphrases)."""

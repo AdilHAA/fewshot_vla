@@ -34,12 +34,13 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     # --- Stage 4 (DEFERRED scaffolding, default-OFF) -----------------------------------
     hn_inject_expert_q: bool = False     # expert q_proj on the cross layers (i % N != 0)
 
-    # --- Trajectory conditioning (leave-one-out task demos) ---------------------------
+    # --- Trajectory conditioning (within-task demo pairing) ----------------------------
     hn_use_traj_clip: bool = False
-    hn_traj_encoder: str = "dino"        # "dino" (CLS/frame) | "vjepa2" (mean-pool/tubelet)
+    hn_traj_encoder: str = "dino"        # "dino" (CLS/frame) | "vjepa2" (tubelet grid-pool)
     hn_xpair_cache_path: str | None = None   # required when hn_use_traj_clip=True
-    hn_pair_mode: str = "loo"            # train pairing: "loo" (leave-one-out) | "same"
-    hn_context_k: int = 8                # demos per conditioning sample (train U{1..k}; eval k)
+    hn_p_self: float = 0.0               # P(context = imitated episode itself); 0.0 = cross
+    hn_context_k: int = 1                # demos per conditioning sample (train and eval)
+    hn_vjepa_grid: int = 2               # vjepa2: s×s spatial tokens per tubelet (1 = mean-pool)
     hn_seed: int = 42                    # selector RNG seed (train stream + eval determinism)
 
     # --- HN fusion extras (neutral => FusionHyperNetwork fast-path == parent) ---------

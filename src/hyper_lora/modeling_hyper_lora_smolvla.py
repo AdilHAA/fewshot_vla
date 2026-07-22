@@ -72,13 +72,10 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         )
         self._freeze_base()
 
-        # Init-frame pairing ablation (vision conditioning). Lazily built bank +
-        # deterministic generator; validated eagerly so a misconfigured run fails
-        # at construction rather than mid-training.
+        # Init-frame pairing (vision conditioning): lazily built bank +
+        # deterministic generator; active iff hn_frame_bank_path is set.
         self._frame_bank = None
         self._bank_gen = torch.Generator().manual_seed(int(getattr(config, "hn_bank_seed", 42)))
-        if getattr(config, "hn_frame_source", "obs") != "obs" and not config.hn_frame_bank_path:
-            raise ValueError("hn_frame_source != 'obs' requires hn_frame_bank_path")
 
         self._lora_cache = None
         self._prev_lora_flat = None
@@ -293,62 +290,21 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         return out
 
     def _bank_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """'same' conditioning: the t=0 frame of the imitated episode itself."""
+        """TRAIN conditioning frame per sample, Bernoulli(hn_p_self): the imitated
+        episode's own t=0 frame (diagonal of the within-task cartesian product) or
+        the t=0 frame of one random OTHER episode of the task (off-diagonal),
+        resampled every step. Originals only."""
         self._ensure_bank()
-        frames = [self._frame_bank.same(int(ep), self._bank_gen)
-                  for ep in batch["episode_index"].tolist()]
+        p_self = float(getattr(self.config, "hn_p_self", 1.0))
+        frames = []
+        for ep, t in zip(batch["episode_index"].tolist(), batch["task_index"].tolist()):
+            use_self = p_self >= 1.0 or (
+                p_self > 0.0 and torch.rand(1, generator=self._bank_gen).item() < p_self)
+            if use_self:
+                frames.append(self._frame_bank.same(int(ep), self._bank_gen))
+            else:
+                frames.append(self._frame_bank.cross(int(t), int(ep), self._bank_gen))
         return self._swap_main(batch, torch.stack(frames))
-
-    def _bank_frame_sets(self, batch: Dict[str, Tensor]) -> list:
-        """'cross' conditioning: ALWAYS hn_context_k t=0 frames from DISTINCT other
-        episodes of the same task ("frames of different trajectories"); fewer only
-        when some task in the batch has a smaller pool (no repeat-padding). One
-        k_step per batch keeps the vision-token count uniform across samples.
-        Returns k_step stacks of (B,C,H,W)."""
-        self._ensure_bank()
-        kmax = int(getattr(self.config, "hn_context_k", 8))
-        pairs = list(zip(batch["episode_index"].tolist(), batch["task_index"].tolist()))
-        avail = [self._frame_bank.n_cross(int(t), int(ep)) for ep, t in pairs]
-        k_step = (min([kmax] + [a for a in avail if a > 0])
-                  if any(a > 0 for a in avail) else 1)
-        per_sample = [self._frame_bank.cross_set(int(t), int(ep), self._bank_gen, k_step)
-                      for ep, t in pairs]
-        return [torch.stack([s[i] for s in per_sample]) for i in range(k_step)]
-
-    def _main_token_slice(self, toks: Tensor, batch: Dict[str, Tensor]) -> Tensor:
-        """Tokens of the main camera only (first in prepare_images order): extra bank
-        frames must not re-contribute duplicate wrist tokens."""
-        n_cams = sum(1 for k in self.config.image_features if k in batch)
-        return toks[:, : toks.shape[1] // max(n_cams, 1)]
-
-    def _bank_eval_sets(self, batch: Dict[str, Tensor]):
-        """Eval few-shot context for 'cross': resolve the task (batch task_index, then
-        the instruction string) and return hn_context_k deterministic bank frames of
-        its train episodes, expanded across envs. None when unresolvable."""
-        self._ensure_bank()
-        ti = batch.get("task_index") if isinstance(batch, dict) else None
-        if ti is not None:
-            ti = int(ti.flatten()[0]) if hasattr(ti, "flatten") else int(ti)
-        else:
-            text = ""
-            for key in ("task", "instruction", "language_instruction", "prompt"):
-                t = batch.get(key) if isinstance(batch, dict) else None
-                if isinstance(t, (list, tuple)) and t:
-                    t = t[0]
-                if isinstance(t, str) and t:
-                    text = t
-                    break
-            ti = self._frame_bank.resolve_task(text) if text else None
-        if ti is None:
-            return None
-        frames = self._frame_bank.task_set(
-            ti, int(getattr(self.config, "hn_context_k", 8)),
-            int(getattr(self.config, "hn_bank_seed", 42)))
-        if not frames:
-            return None
-        bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
-        dev = next(self.parameters()).device
-        return [f.unsqueeze(0).expand(bsz, -1, -1, -1).to(dev) for f in frames]
 
     def _inject_lora(self, batch: Dict[str, Tensor]) -> None:
         # At eval, optionally reuse a per-episode adapter to break the
@@ -363,56 +319,24 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         with torch.set_grad_enabled(self.training):
             text_embeds = self._embed_language(lang_tokens)
 
-        # Init-frame pairing ablation: at TRAIN time swap the conditioning images.
-        # 'same' = the imitated episode's own t=0 frame; 'cross' = k t=0 frames from
-        # distinct other episodes of the task. The default "obs" path leaves
-        # cond_batch == batch, so vision behavior is bit-for-bit unchanged.
+        # Init-frame pairing: at TRAIN time, with a frame bank configured, the
+        # conditioning main-camera frame comes from the bank (p_self: own episode's
+        # t=0 vs another episode's t=0). At EVAL — and always without a bank — the
+        # HN conditions on the batch itself (the rollout's own frames; freeze the
+        # adapter per episode via HN_LORA_CACHE=episode).
         cond_batch = batch
-        extra_frames = []
-        rep_k = 0
-        if getattr(self.config, "hn_frame_source", "obs") == "cross" and not self.training:
-            # cross-trained HN always consumed hn_context_k frames. Preferred: resolve
-            # the task and feed k bank frames of its TRAIN episodes (format == train).
-            # Fallback (bank has no task_texts / unresolvable): replicate the rollout
-            # frame to match the train-time token count.
-            sets = self._bank_eval_sets(batch)
-            if sets:
-                cond_batch = self._swap_main(batch, sets[0])
-                extra_frames = sets[1:]
-            else:
-                rep_k = int(getattr(self.config, "hn_context_k", 8)) - 1
-        if self.training and getattr(self.config, "hn_frame_source", "obs") != "obs":
-            if self.config.hn_frame_source == "cross":
-                sets = self._bank_frame_sets(batch)
-                cond_batch = self._swap_main(batch, sets[0])
-                extra_frames = sets[1:]
-            else:
-                cond_batch = self._bank_batch(batch)
+        if self.training and getattr(self.config, "hn_frame_bank_path", None):
+            cond_batch = self._bank_batch(batch)
 
         # Vision conditioning inputs come from frozen encoders, so compute them
         # under no_grad (cheaper); the hypernet still trains via the LoRA path.
-        # Frames beyond the first contribute only their main-camera tokens.
         vlm_vision_embeds = None
         dino_embeds = None
         with torch.no_grad():
             if self.config.hn_use_vlm_vision:
                 vlm_vision_embeds = self._vlm_vision_features(cond_batch)
-                if extra_frames:
-                    extras = [self._main_token_slice(
-                        self._vlm_vision_features(self._swap_main(batch, f)), batch)
-                        for f in extra_frames]
-                    vlm_vision_embeds = torch.cat([vlm_vision_embeds] + extras, dim=1)
-                elif rep_k > 0:
-                    ms = self._main_token_slice(vlm_vision_embeds, batch)
-                    vlm_vision_embeds = torch.cat([vlm_vision_embeds] + [ms] * rep_k, dim=1)
             if self.config.hn_use_dino:
                 dino_embeds = self._dino_features(cond_batch)
-                if extra_frames:
-                    extras = [self._dino_features(self._swap_main(batch, f))
-                              for f in extra_frames]
-                    dino_embeds = torch.cat([dino_embeds] + extras, dim=1)
-                elif rep_k > 0:
-                    dino_embeds = torch.cat([dino_embeds] * (rep_k + 1), dim=1)
 
         weights = self.hypernet(
             text_embeds, lang_masks, vlm_vision_embeds, dino_embeds

@@ -32,12 +32,13 @@
 #                                     --encoder $ENC)
 #   KV         (0)                    1 = also inject LoRA at the VLM k/v routing
 #                                     site (traj mode)
-#   PAIR       (loo)                 conditioning pair mode, shared by two modes:
-#                                     traj (->hn_pair_mode):    same | loo (leave-one-out)
-#                                     vision (->hn_frame_source): obs | same | cross.
-#                                     Unset (or the traj default "loo") maps to obs =
-#                                     legacy current-observation conditioning.
-#   K          (8)                   traj mode: number of context demos per sample
+#   PAIR       (cross)               train pairing sugar -> hn_p_self:
+#                                     same = 1.0 (context from the imitated episode),
+#                                     cross|loo = 0.0 (one other episode of the task);
+#                                     vision only: obs = legacy no-bank conditioning.
+#   P_SELF     ()                    explicit hn_p_self override (e.g. 0.5 mix)
+#   K          (1)                   context size (demos/frames per sample)
+#   VGRID      (2)                   traj+vjepa2: s×s spatial tokens per tubelet
 #   BANK       (outputs/frame_bank.npz)  vision mode, PAIR=same|cross: first-frame
 #                                     bank path (build with the frame-bank script)
 #   VLM        (1)                   vision mode: 1 = condition HN on the VLM's own
@@ -69,8 +70,19 @@ DINO_ID="${DINO_ID:-facebook/dinov2-base}"
 ENC="${ENC:-dino}"
 XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/$ENC}"
 KV="${KV:-0}"
-PAIR="${PAIR:-loo}"
-K="${K:-8}"
+PAIR="${PAIR:-cross}"
+P_SELF="${P_SELF:-}"
+K="${K:-1}"
+VGRID="${VGRID:-2}"
+# PAIR sugar -> p_self (explicit P_SELF wins); "loo" is an alias of "cross".
+case "$PAIR" in loo) PAIR=cross ;; esac
+if [ -z "$P_SELF" ]; then
+    case "$PAIR" in
+        same)  P_SELF=1.0 ;;
+        cross) P_SELF=0.0 ;;
+        obs)   P_SELF=1.0 ;;   # unused without a bank; vision legacy mode
+    esac
+fi
 BANK="${BANK:-outputs/frame_bank.npz}"
 VLM="${VLM:-1}"
 [ "$KV" = "1" ] && KV_FLAG=true || KV_FLAG=false
@@ -85,7 +97,22 @@ WANDB_PROJECT="${WANDB_PROJECT:-hyper-lora}"
 [ "${TB:-0}" = "1" ] && { WANDB_FLAG=true; export TENSORBOARD=1; }
 
 case "$MODE" in
-    vision) DEFAULT_OUTPUT="outputs/hyper_lora_vision"; BATCH="${BATCH:-16}" ;;
+    vision)
+        # PAIR=obs -> legacy conditioning on the current observation (no bank).
+        # PAIR=same|cross -> t=0 bank frame with hn_p_self (1.0 own / 0.0 other
+        # episode of the task), resampled every step.
+        MODE_ARGS+=(
+            --policy.type=hyper_lora_smolvla
+            --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
+            --policy.hn_use_dino=true
+            --policy.hn_dino_model_id="$DINO_ID"
+            --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
+            --policy.train_action_expert="$EXPERT_FLAG"
+        )
+        [ "$PAIR" != "obs" ] && MODE_ARGS+=(
+            --policy.hn_frame_bank_path="$BANK"
+            --policy.hn_p_self="$P_SELF"
+        ) ;;
     text)   DEFAULT_OUTPUT="outputs/hyper_lora_text";   BATCH="${BATCH:-32}" ;;
     lora)   DEFAULT_OUTPUT="outputs/lora_baseline";     BATCH="${BATCH:-32}" ;;
     traj)   DEFAULT_OUTPUT="outputs/hyper_lora_traj_$ENC"; BATCH="${BATCH:-32}" ;;
@@ -123,22 +150,21 @@ python -c "from src.data.libero import prefetch_all_data_parquets as p; p()"
 MODE_ARGS=()
 case "$MODE" in
     vision)
-        # PAIR serves both modes: for vision, obs (legacy) is the default, so an
-        # unset PAIR (or the traj default "loo") maps to obs. PAIR=same|cross pick
-        # the init-frame ablation arms; only those pass a frame-bank path.
-        vpair=$PAIR
-        [ "$vpair" = "loo" ] && vpair=obs
+        # PAIR=obs -> legacy conditioning on the current observation (no bank).
+        # PAIR=same|cross -> the t=0 bank frame with hn_p_self (1.0 = own episode,
+        # 0.0 = one random other episode of the task), resampled every step.
         MODE_ARGS+=(
             --policy.type=hyper_lora_smolvla
             --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
-            --policy.hn_frame_source="$vpair"
-            --policy.hn_context_k="$K"
             --policy.hn_use_dino=true
             --policy.hn_dino_model_id="$DINO_ID"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"
         )
-        [ "$vpair" != "obs" ] && MODE_ARGS+=(--policy.hn_frame_bank_path="$BANK") ;;
+        [ "$PAIR" != "obs" ] && MODE_ARGS+=(
+            --policy.hn_frame_bank_path="$BANK"
+            --policy.hn_p_self="$P_SELF"
+        ) ;;
     text)
         MODE_ARGS+=(
             --policy.type=hyper_lora_smolvla
@@ -168,8 +194,9 @@ case "$MODE" in
             --policy.hn_use_traj_clip=true
             --policy.hn_xpair_cache_path="$XPAIR_CACHE"
             --policy.hn_traj_encoder="$ENC"
-            --policy.hn_pair_mode="$PAIR"
+            --policy.hn_p_self="$P_SELF"
             --policy.hn_context_k="$K"
+            --policy.hn_vjepa_grid="$VGRID"
             --policy.hn_inject_vlm_kv="$KV_FLAG"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"

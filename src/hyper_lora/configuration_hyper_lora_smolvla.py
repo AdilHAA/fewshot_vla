@@ -62,12 +62,13 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     # HN_LORA_CACHE={off,episode} overrides this at runtime.
     hn_lora_cache_eval: bool = False
 
-    # --- Init-frame pairing ablation (vision conditioning) ----------------------------
-    # "obs" = condition on the current observation (legacy). "same"/"cross" = at TRAIN
-    # time condition on the t=0 frame of the imitated episode / of another same-task
-    # episode, read from the first-frame bank. Eval always uses the rollout's own
-    # frames (freeze the adapter at t=0 via HN_LORA_CACHE=episode).
-    hn_frame_source: str = "obs"
+    # --- Init-frame pairing (vision conditioning) --------------------------------------
+    # With hn_frame_bank_path set, the TRAIN-time conditioning frame comes from the
+    # first-frame bank: with prob hn_p_self the imitated episode's own t=0 frame
+    # (same, the diagonal of the within-task cartesian product), else the t=0 frame
+    # of one random other episode of the task (cross). Without a bank path the HN
+    # conditions on the current observation (legacy). Eval always uses the rollout's
+    # own frames (freeze the adapter at t=0 via HN_LORA_CACHE=episode).
     hn_frame_bank_path: str | None = None
+    hn_p_self: float = 1.0
     hn_bank_seed: int = 42
-    hn_context_k: int = 8    # cross: max t=0 frames from distinct other episodes

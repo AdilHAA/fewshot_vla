@@ -16,9 +16,9 @@
 #   EPISODES  (50)                episodes per task (BATCH must divide it)
 #   BATCH     (2)                 parallel envs per task (24GB -> 2)
 #   OUT_ROOT  (outputs/eval_matrix)  root dir for all cells
-#   EPISODE_CACHE (0)                set to 1 to build the adapter once per episode
-#                                    (REQUIRED for traj policies; also used by the
-#                                    vision init-frame ablations)
+#   EPISODE_CACHE (1)                build the adapter once per episode and freeze it
+#                                    (the v2 protocol for every conditioned arm);
+#                                    set 0 to regenerate per inference (legacy)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -35,7 +35,7 @@ SEEDS="${SEEDS:-1000 2000 3000}"
 EPISODES="${EPISODES:-50}"
 BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
-[ "${EPISODE_CACHE:-0}" != "0" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
+[ "${EPISODE_CACHE:-1}" != "0" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
 
 # Guard: refuse to start if the GPU is already busy (avoids two-process OOM).
 if command -v nvidia-smi >/dev/null 2>&1; then

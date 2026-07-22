@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.traj_data.cache_io import CacheHeader, write_cache
-from src.traj_data.encoder import ENCODER_FORMAT, build_traj_encoder
+from src.traj_data.encoder import build_traj_encoder, encoder_format
 
 
 def make_chunked(encode, chunk: int, even: bool = False):
@@ -99,10 +99,13 @@ def main(argv=None):  # pragma: no cover (GPU)
                    help="dir of ep*.npz rendered variants (render_recolor_clips.py)")
     p.add_argument("--chunk", type=int, default=0,
                    help="temporal encode chunk (0 = auto: dino 64, vjepa2 32)")
+    p.add_argument("--vjepa_grid", type=int, default=2,
+                   help="vjepa2: s×s spatial tokens per tubelet (1 = legacy mean-pool)")
     args = p.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    _, encode = build_traj_encoder(args.encoder, args.encoder_model, device)
+    _, encode = build_traj_encoder(args.encoder, args.encoder_model, device,
+                                   vjepa_grid=args.vjepa_grid)
     chunk = args.chunk or (32 if args.encoder == "vjepa2" else 64)
     encode = make_chunked(encode, chunk, even=(args.encoder == "vjepa2"))
 
@@ -128,7 +131,8 @@ def main(argv=None):  # pragma: no cover (GPU)
 
     episodes = _load_episodes(args.repo_id, args.revision)
     seqs, records, header, task_texts = build_records(
-        episodes, encode, args.encoder, ENCODER_FORMAT[args.encoder], aug_set,
+        episodes, encode, args.encoder,
+        encoder_format(args.encoder, args.vjepa_grid), aug_set,
         extra_variants=extra_variants)
     write_cache(args.out, seqs, records, header, task_texts)
     print(f"wrote {header.num_records} records "

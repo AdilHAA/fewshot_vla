@@ -8,9 +8,9 @@ params and `_inject_lora` passes no `traj_embeds`).
 When `hn_use_traj_clip=True` this policy conditions the hypernetwork on task demos read
 from the offline `TrajCache` (`hn_xpair_cache_path`); `traj_dim` comes from the cache
 header, so no encoder model is loaded at construction or during training:
-  * TRAIN: `_inject_lora` reads context demos chosen by the leave-one-out selector
-    (`hn_pair_mode`: 'loo' same-task minus the imitated episode, or 'same') — see
-    `tests/test_xpair_select.py`;
+  * TRAIN: `_inject_lora` reads the context demo chosen by the p_self selector
+    (`hn_p_self`: prob of the imitated episode itself; 0.0 = one other same-task
+    demo, the off-diagonal of the within-task cartesian product);
   * EVAL: the base task is resolved (batch `task_index`, else the decoded instruction
     matched against the cache `task_texts`) and its K cached demos are read
     deterministically, then expanded across the vectorized env batch.
@@ -57,13 +57,14 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         if config.hn_use_traj_clip:
             if not config.hn_xpair_cache_path:
                 raise ValueError("hn_use_traj_clip=True requires hn_xpair_cache_path")
-            from src.traj_data.encoder import ENCODER_FORMAT
+            from src.traj_data.encoder import encoder_format
             from src.traj_data.traj_cache import TrajCache
 
             self._traj_cache = TrajCache(config.hn_xpair_cache_path)
             self._traj_cache.assert_header_matches(
                 encoder_id=config.hn_traj_encoder,
-                format=ENCODER_FORMAT[config.hn_traj_encoder])
+                format=encoder_format(config.hn_traj_encoder,
+                                      getattr(config, "hn_vjepa_grid", 2)))
             traj_dim = int(self._traj_cache.header["d_enc"])
 
         tm = self.hypernet.target_modules
@@ -171,19 +172,15 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             ep = ep.tolist() if hasattr(ep, "tolist") else list(ep)
             t = t.tolist() if hasattr(t, "tolist") else list(t)
             traj, mask, marks = select_train_conditioning(
-                self._traj_cache, ep, t, self.config.hn_pair_mode,
+                self._traj_cache, ep, t, self.config.hn_p_self,
                 self.config.hn_context_k, self._traj_gen)
             return traj.to(dev), mask.to(dev), marks.to(dev)
         # EVAL: every env in a rollout batch runs the same suite task -> one lookup,
-        # deterministic demo pick, expanded across the env batch.
-        # Context size must match what the HN consumed at train time: a same-trained
-        # HN only ever saw ONE demo per sample; feeding it k>1 concatenated demos is
-        # out-of-distribution input and yields garbage adapters.
+        # deterministic demo pick, expanded across the env batch. Context size equals
+        # hn_context_k for every arm — the train/eval format always matches.
         task_index = self._resolve_eval_task(batch)
-        k = 1 if getattr(self.config, "hn_pair_mode", "loo") == "same" \
-            else self.config.hn_context_k
         demos = select_eval_conditioning(
-            self._traj_cache, task_index, k, self.config.hn_seed)
+            self._traj_cache, task_index, self.config.hn_context_k, self.config.hn_seed)
         bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
         traj, mask, marks = pack_conditioning([demos] * bsz)
         logger.warning("[TRAJ] task=%d demos=%d tokens=%d",

@@ -114,8 +114,18 @@ def merge_shards(out_dir: str, shard_dirs: list) -> tuple:
     return len(records), total
 
 
-def _load_episodes(repo_id, revision, shard=0, num_shards=1):  # pragma: no cover (GPU/dataset)
-    """Yield full episodes from lerobot/libero (LeRobotDataset 0.5.1) — ALL frames."""
+def _load_episodes(repo_id, revision, shard=0, num_shards=1,
+                   workers=8):  # pragma: no cover (GPU/dataset)
+    """Yield full episodes from lerobot/libero (LeRobotDataset 0.5.1) — ALL frames.
+
+    Per-frame `ds[i]` access random-seeks into the episode videos and decodes one
+    frame at a time — the actual bottleneck of a full-frame build. Frames are
+    therefore streamed through a DataLoader with `workers` parallel decoders
+    (order-preserving), and sliced back into episodes here."""
+    from collections import deque
+
+    from torch.utils.data import DataLoader, Subset
+
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     from src.data.libero import prefetch_all_data_parquets
@@ -128,7 +138,7 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1):  # pragma: no cove
     def _erow(i):
         return eps.iloc[i].to_dict() if hasattr(eps, "iloc") else eps[i]
 
-    acc = 0
+    plan, acc = [], 0
     for ep in range(ds.meta.total_episodes):
         row = _erow(ep)
         if row.get("dataset_from_index") is not None:
@@ -137,12 +147,36 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1):  # pragma: no cove
         else:
             start, length = acc, int(row["length"])
             acc += length
-        if ep % num_shards != shard:
-            continue
-        frames = torch.stack([ds[start + i][img_key] for i in range(length)])
-        first = ds[start]
-        yield {"frames": frames, "instruction": first.get("task", ""),
-               "episode": ep, "task_index": int(first["task_index"])}
+        if ep % num_shards == shard:
+            plan.append((ep, start, length))
+
+    idxs = [i for _, start, length in plan for i in range(start, start + length)]
+    loader = DataLoader(Subset(ds, idxs), batch_size=64, shuffle=False,
+                        num_workers=workers)
+
+    pending = deque(plan)
+    cur_ep, _, cur_need = pending.popleft()
+    cur_frames, cur_meta, done = [], None, 0
+    for batch in loader:
+        imgs = batch[img_key]
+        tasks = batch.get("task")
+        tis = batch["task_index"]
+        for j in range(imgs.shape[0]):
+            if cur_meta is None:
+                cur_meta = (tasks[j] if tasks is not None else "", int(tis[j]))
+            cur_frames.append(imgs[j])
+            if len(cur_frames) == cur_need:
+                done += 1
+                if done % 20 == 0 or done == len(plan):
+                    print(f"[shard {shard}] decoded {done}/{len(plan)} episodes",
+                          flush=True)
+                yield {"frames": torch.stack(cur_frames), "instruction": cur_meta[0],
+                       "episode": cur_ep, "task_index": cur_meta[1]}
+                cur_frames, cur_meta = [], None
+                if pending:
+                    cur_ep, _, cur_need = pending.popleft()
+    if cur_frames or pending:
+        raise RuntimeError(f"decode stream ended early: {len(pending)} episodes left")
 
 
 def main(argv=None):  # pragma: no cover (GPU)
@@ -163,6 +197,8 @@ def main(argv=None):  # pragma: no cover (GPU)
                    help=">1: encode episodes ep%%num_shards==shard into <out>.shard<i>")
     p.add_argument("--merge_shards", type=int, default=0,
                    help="merge <out>.shard0..N-1 into <out> (no GPU) and exit")
+    p.add_argument("--workers", type=int, default=8,
+                   help="parallel frame-decode workers (decode is the bottleneck)")
     args = p.parse_args(argv)
 
     if args.merge_shards:
@@ -198,7 +234,8 @@ def main(argv=None):  # pragma: no cover (GPU)
         print(f"rendered variants: {sum(len(v) for v in rendered.values())} clips, tags={tags}")
 
     out_dir = (f"{args.out}.shard{args.shard}" if args.num_shards > 1 else args.out)
-    episodes = _load_episodes(args.repo_id, args.revision, args.shard, args.num_shards)
+    episodes = _load_episodes(args.repo_id, args.revision, args.shard,
+                              args.num_shards, workers=args.workers)
     seqs, records, header, task_texts = build_records(
         episodes, encode, args.encoder,
         encoder_format(args.encoder, args.vjepa_grid), aug_set,

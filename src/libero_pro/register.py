@@ -133,22 +133,34 @@ def ensure_registered(repo_id: str = "zhouxueyang/LIBERO-Pro") -> list[str]:
     if not suite_dirs:
         raise RuntimeError(f"No bddl_files/<suite> dirs in snapshot {root}")
 
+    skipped: list[str] = []
     for suite in suite_dirs:
         if suite in _lb.get_benchmark_dict():
             _REGISTERED.add(suite)
             continue
-        bddl_dir, init_dir = _install_suite(root, suite)
-        # Object axis: synthesize the visually-changed objects (bigger_*/<color>_*)
-        # that LIBERO-Pro renames to but ships no assets for, else env build KeyErrors.
-        if suite.endswith("_object"):
-            register_object_keys(object_categories_in_bddls(bddl_dir))
-        task_map = _build_task_map(suite, bddl_dir, init_dir)
-        _register_suite(suite, task_map)
-        _REGISTERED.add(suite)
+        # A suite that doesn't lay out as exactly 10 <name>.bddl + <name>.pruned_init
+        # (e.g. a newly-added axis with a different naming/nesting scheme) must not
+        # abort registration of the suites we do use — skip it with a warning.
+        try:
+            bddl_dir, init_dir = _install_suite(root, suite)
+            if suite.endswith("_object"):
+                # Object axis: synthesize the visually-changed objects the BDDLs
+                # rename to but ship no assets for, else env build KeyErrors.
+                register_object_keys(object_categories_in_bddls(bddl_dir))
+            task_map = _build_task_map(suite, bddl_dir, init_dir)
+            _register_suite(suite, task_map)
+            _REGISTERED.add(suite)
+        except Exception as e:
+            skipped.append(f"{suite} ({type(e).__name__}: {e})")
 
-    logger.info(
-        "Registered %d LIBERO-Pro suites: %s",
-        len(_REGISTERED),
-        ", ".join(perturbed_suite_names()),
-    )
+    if not _REGISTERED:
+        raise RuntimeError(
+            f"No LIBERO-Pro suite registered from {root}; all {len(suite_dirs)} "
+            f"skipped: {'; '.join(skipped)}"
+        )
+    logger.info("Registered %d LIBERO-Pro suites: %s",
+                len(_REGISTERED), ", ".join(perturbed_suite_names()))
+    if skipped:
+        logger.warning("Skipped %d LIBERO-Pro suite dir(s): %s",
+                       len(skipped), ", ".join(skipped))
     return perturbed_suite_names()

@@ -258,8 +258,17 @@ case "$MODE" in
         # Trajectory-conditioned hypernet: the HN reads a demo clip from the
         # offline cache. Build it first with scripts/build_xpair_cache.py.
         if [ ! -d "$XPAIR_CACHE" ]; then
-            echo "ERROR: traj cache '$XPAIR_CACHE' not found — build it first:" >&2
-            echo "       bash scripts/build_all_caches.sh" >&2
+            echo "ERROR: traj cache '$XPAIR_CACHE' not found." >&2
+            case "$XPAIR_CACHE" in
+                /*/*) : ;;
+                /*)   echo "       That path starts at the filesystem root with a single" >&2
+                      echo "       component — the usual cause is an UNSET shell variable," >&2
+                      echo "       e.g. XPAIR_CACHE=\$D/dino with \$D empty. Pass the full" >&2
+                      echo "       path literally: XPAIR_CACHE=outputs/xpair_cache/dino" >&2 ;;
+            esac
+            echo "       Available caches:" >&2
+            ls -1d outputs/xpair_cache/*/ 2>/dev/null | sed 's|^|         |' >&2 \
+                || echo "         (none — build them: bash scripts/build_all_caches.sh)" >&2
             exit 1
         fi
         if [ "$VLM" = "1" ] && [ ! -f "$BANK" ]; then

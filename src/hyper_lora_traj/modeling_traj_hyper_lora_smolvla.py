@@ -61,10 +61,28 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             from src.traj_data.traj_cache import TrajCache
 
             self._traj_cache = TrajCache(config.hn_xpair_cache_path)
-            self._traj_cache.assert_header_matches(
-                encoder_id=config.hn_traj_encoder,
-                format=encoder_format(config.hn_traj_encoder,
-                                      getattr(config, "hn_vjepa_grid", 2)))
+            # The format tag carries encoder, grid AND temporal scope, so a
+            # 1-token minimal-clip cache can no longer be silently accepted by a
+            # full-clip config (and vice versa). encoder_model/chunk are opt-in
+            # pins: they are invisible in the tokens, so leaving them unset keeps
+            # every previously trained checkpoint loadable.
+            expected = {
+                "encoder_id": config.hn_traj_encoder,
+                "format": encoder_format(
+                    config.hn_traj_encoder,
+                    getattr(config, "hn_vjepa_grid", 2),
+                    time_select=getattr(config, "hn_traj_time_select", "all"),
+                    n_frames=getattr(config, "hn_traj_n_frames", 0),
+                    fill=getattr(config, "hn_traj_fill", ""),
+                    dino_grid=getattr(config, "hn_dino_grid", 0),
+                    include_cls=getattr(config, "hn_dino_include_cls", True),
+                    n_reg=getattr(config, "hn_dino_n_reg", 0)),
+            }
+            if getattr(config, "hn_traj_encoder_model", ""):
+                expected["encoder_model"] = config.hn_traj_encoder_model
+            if int(getattr(config, "hn_traj_chunk", 0)):
+                expected["chunk"] = int(config.hn_traj_chunk)
+            self._traj_cache.assert_header_matches(**expected)
             traj_dim = int(self._traj_cache.header["d_enc"])
 
         tm = self.hypernet.target_modules
@@ -91,6 +109,12 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             stream_type_emb=config.hn_stream_type_emb,
             per_stream_null=config.hn_per_stream_null,
             readout=config.hn_readout,
+            traj_pos_emb=getattr(config, "hn_traj_pos_emb", "none"),
+            traj_max_pos=getattr(config, "hn_traj_max_pos", 512),
+            traj_sub_emb=getattr(config, "hn_traj_sub_emb", False),
+            traj_tokens_per_unit=(int(self._traj_cache.header.get("tokens_per_unit", 1))
+                                  if self._traj_cache is not None else 1),
+            traj_pos_std=getattr(config, "hn_traj_pos_std", 0.02),
         )
         self._freeze_base()
         self._traj_gen = torch.Generator().manual_seed(int(config.hn_seed))
@@ -139,22 +163,34 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         with torch.set_grad_enabled(self.training):
             text_embeds = self._embed_language(lang_tokens)
 
+        # Same init-frame pairing as the parent: with a frame bank configured, the
+        # TRAIN conditioning frame is a t=0 frame from the bank (hn_p_self: own
+        # episode vs another of the task), not the current step's frame. Without
+        # this the VLM stream would see episode E at a random t on train and the
+        # rollout's t=0 at eval (HN_LORA_CACHE=episode) — a train/eval mismatch that
+        # has nothing to do with what the traj arm is meant to measure.
+        cond_batch = batch
+        if self.training and getattr(self.config, "hn_frame_bank_path", None):
+            cond_batch = self._bank_batch(batch)
+
         vlm_vision_embeds = None
         dino_embeds = None
         with torch.no_grad():
             if self.config.hn_use_vlm_vision:
-                vlm_vision_embeds = self._vlm_vision_features(batch)
+                vlm_vision_embeds = self._vlm_vision_features(cond_batch)
             if self.config.hn_use_dino:
-                dino_embeds = self._dino_features(batch)
+                dino_embeds = self._dino_features(cond_batch)
 
-        traj_embeds = traj_mask = traj_marks = None
+        traj_embeds = traj_mask = traj_marks = traj_pos = traj_sub = None
         if getattr(self.config, "hn_use_traj_clip", False):
             with torch.no_grad():
-                traj_embeds, traj_mask, traj_marks = self._build_traj_conditioning(batch)
+                (traj_embeds, traj_mask, traj_marks,
+                 traj_pos, traj_sub) = self._build_traj_conditioning(batch)
 
         weights = self.hypernet(
             text_embeds, lang_masks, vlm_vision_embeds, dino_embeds,
             traj_embeds=traj_embeds, traj_mask=traj_mask, traj_marks=traj_marks,
+            traj_pos=traj_pos, traj_sub=traj_sub,
         )
         if os.environ.get("HN_LOG_LORA"):
             self._log_lora_drift(weights)
@@ -171,10 +207,10 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             ep, t = batch["episode_index"], batch["task_index"]
             ep = ep.tolist() if hasattr(ep, "tolist") else list(ep)
             t = t.tolist() if hasattr(t, "tolist") else list(t)
-            traj, mask, marks = select_train_conditioning(
+            packed = select_train_conditioning(
                 self._traj_cache, ep, t, self.config.hn_p_self,
                 self.config.hn_context_k, self._traj_gen)
-            return traj.to(dev), mask.to(dev), marks.to(dev)
+            return tuple(x.to(dev) for x in packed)
         # EVAL: every env in a rollout batch runs the same suite task -> one lookup,
         # deterministic demo pick, expanded across the env batch. Context size equals
         # hn_context_k for every arm — the train/eval format always matches.
@@ -182,10 +218,11 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         demos = select_eval_conditioning(
             self._traj_cache, task_index, self.config.hn_context_k, self.config.hn_seed)
         bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
-        traj, mask, marks = pack_conditioning([demos] * bsz)
+        packed = pack_conditioning([demos] * bsz,
+                                   int(self._traj_cache.header.get("tokens_per_unit", 1)))
         logger.warning("[TRAJ] task=%d demos=%d tokens=%d",
-                       task_index, len(demos), traj.shape[1])
-        return traj.to(dev), mask.to(dev), marks.to(dev)
+                       task_index, len(demos), packed[0].shape[1])
+        return tuple(x.to(dev) for x in packed)
 
     def _resolve_eval_task(self, batch: Dict[str, Tensor]) -> int:
         """Base-task lookup: batch task_index when present, else the instruction

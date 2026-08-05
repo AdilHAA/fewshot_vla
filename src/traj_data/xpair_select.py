@@ -9,26 +9,44 @@ def _choice(n: int, g: torch.Generator) -> int:
     return int(torch.randint(n, (1,), generator=g).item())
 
 
-def pack_conditioning(samples):
+def pack_conditioning(samples, tokens_per_unit: int = 1):
     """samples: per-batch-item lists of (L_i, D) demo tensors -> padded batch.
+
     Returns (traj (B,Lmax,D), mask (B,Lmax) True==pad, marks (B,Lmax) long with
-    1 on each demo's first token, 2 on its last, 0 elsewhere)."""
+    1 on each demo's first token, 2 on its last, 0 elsewhere, pos (B,Lmax) long =
+    index of the token's UNIT within its own demo, sub (B,Lmax) long = index of the
+    token within its unit).
+
+    `pos` counts units (frames for dino, tubelets for vjepa2), not slots: tokens are
+    unit-major, so the `tokens_per_unit` tokens of one frame must share one time.
+    It RESETS at every demo boundary — a running arange across demos would invent a
+    single continuous timeline out of unrelated trajectories.
+    Padding slots keep pos=sub=0; they are masked out as attention keys, so their
+    value cannot reach the output (verified: perturbing them moves it by exactly 0).
+    """
     B = len(samples)
+    u = max(int(tokens_per_unit), 1)
     lens = [sum(d.shape[0] for d in demos) for demos in samples]
     L, D = max(lens), samples[0][0].shape[-1]
     traj = samples[0][0].new_zeros(B, L, D)
     mask = torch.ones(B, L, dtype=torch.bool)
     marks = torch.zeros(B, L, dtype=torch.long)
+    pos = torch.zeros(B, L, dtype=torch.long)
+    sub = torch.zeros(B, L, dtype=torch.long)
     for b, demos in enumerate(samples):
         off = 0
         for d in demos:
             n = d.shape[0]
             traj[b, off:off + n] = d
             marks[b, off] = 1
-            marks[b, off + n - 1] = 2
+            if n > 1:                      # n==1 would overwrite the start mark
+                marks[b, off + n - 1] = 2
+            slot = torch.arange(n)
+            pos[b, off:off + n] = slot // u
+            sub[b, off:off + n] = slot % u
             off += n
         mask[b, :off] = False
-    return traj, mask, marks
+    return traj, mask, marks, pos, sub
 
 
 def select_train_conditioning(cache, episode_idx, task_idx, p_self: float,
@@ -52,7 +70,7 @@ def select_train_conditioning(cache, episode_idx, task_idx, p_self: float,
             perm = torch.randperm(len(other), generator=generator).tolist()
             sel = [other[i] for i in perm[:k_step]]
         samples.append([cache.read_row(r) for r in sel])
-    return pack_conditioning(samples)
+    return pack_conditioning(samples, int(cache.header.get("tokens_per_unit", 1)))
 
 
 def select_eval_conditioning(cache, task_index: int, k: int, seed: int):

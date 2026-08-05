@@ -51,6 +51,9 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     hn_use_vlm_vision: bool = False  # condition HN on the frozen VLM's own image tokens
     hn_use_dino: bool = False        # additionally condition on a frozen external DINOv2
     hn_dino_model_id: str = "facebook/dinov2-base"
+    # Which DINO tokens reach the HN: "all" = the full 1+n_reg+patches sequence
+    # (legacy), "cls" = the global token only (the dummy ablation of direction 1).
+    hn_dino_tokens: str = "all"
 
     # At EVAL only: cache the generated LoRA adapter once per episode (computed on
     # the first observation after reset) and reuse it for the whole rollout,

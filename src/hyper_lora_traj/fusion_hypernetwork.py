@@ -31,6 +31,11 @@ class FusionHyperNetwork(HyperNetwork):
         stream_type_emb: bool = False,
         per_stream_null: bool = False,
         readout: str = "queries",
+        traj_pos_emb: str = "none",
+        traj_max_pos: int = 512,
+        traj_sub_emb: bool = False,
+        traj_tokens_per_unit: int = 1,
+        traj_pos_std: float = 0.02,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)  # base HyperNetwork; lines unchanged
@@ -38,6 +43,9 @@ class FusionHyperNetwork(HyperNetwork):
         self.stream_type_emb = stream_type_emb
         self.per_stream_null = per_stream_null
         self.readout = readout
+        self.traj_pos_emb = traj_pos_emb
+        self.traj_max_pos = int(traj_max_pos)
+        self.traj_sub_emb = traj_sub_emb
         # Extra params are constructed ONLY behind their flag, so an all-OFF instance
         # has exactly the parent's parameter/state_dict keys (byte-compat).
         if use_traj:
@@ -45,6 +53,26 @@ class FusionHyperNetwork(HyperNetwork):
             # boundaries between demos are additive mark embeddings (1=start, 2=end).
             self.traj_proj = nn.Linear(traj_dim, self.hidden_size)
             self.traj_mark_embedding = nn.Embedding(3, self.hidden_size)
+        if use_traj and traj_pos_emb != "none":
+            if traj_pos_emb not in ("index", "phase"):
+                raise ValueError(f"traj_pos_emb must be none|index|phase, got {traj_pos_emb!r}")
+            # ONE table for both coordinates, so `index` vs `phase` differs in exactly
+            # one thing — what the row index MEANS — and not in parameter count or
+            # parameterisation. `index` = unit number, `phase` = unit number rescaled
+            # to [0, max_pos-1] by the demo's own length.
+            self.traj_pos_embedding = nn.Embedding(self.traj_max_pos, self.hidden_size)
+            # nn.Embedding defaults to N(0,1), which is ~50x the scale of traj_proj's
+            # output and would swamp the content. Fixed small std keeps `index` and
+            # `phase` starting from the same effective strength.
+            nn.init.normal_(self.traj_pos_embedding.weight, std=float(traj_pos_std))
+        if use_traj and traj_sub_emb:
+            # Which token WITHIN a unit this is (grid cell / register slot). Without
+            # it the tokens of one frame are an unordered bag, so a null result on the
+            # patch/register arms cannot be told apart from "the HN could not tell
+            # which token was which".
+            self.traj_sub_embedding = nn.Embedding(max(int(traj_tokens_per_unit), 1),
+                                                   self.hidden_size)
+            nn.init.normal_(self.traj_sub_embedding.weight, std=float(traj_pos_std))
         if stream_type_emb:
             self.stream_type_embedding = nn.Embedding(4, self.hidden_size)
 
@@ -56,6 +84,21 @@ class FusionHyperNetwork(HyperNetwork):
             or self.readout == "xattn"
         )
 
+    def _pos_rows(self, traj_pos):
+        """Unit index -> row of the shared position table.
+
+        `index`: the unit number itself, clamped. Absolute, so "frame 100" is the
+                 middle of a 200-frame demo and nearly the end of a 110-frame one,
+                 and rows past p99 (398 of 505) are trained by <1% of episodes.
+        `phase` : the same number rescaled by the demo's OWN length to fill the
+                 table, so the row means "how far through the demo", length-invariant.
+        Both use the same table and the same parameter count — the pair therefore
+        isolates the COORDINATE and nothing else."""
+        if self.traj_pos_emb == "index":
+            return traj_pos.clamp(max=self.traj_max_pos - 1)
+        last = traj_pos.max(dim=1, keepdim=True).values.clamp(min=1)
+        return ((traj_pos.float() / last.float()) * (self.traj_max_pos - 1)).round().long()
+
     def forward(
         self,
         text_token_embeds,
@@ -65,6 +108,8 @@ class FusionHyperNetwork(HyperNetwork):
         traj_embeds=None,
         traj_mask=None,
         traj_marks=None,
+        traj_pos=None,
+        traj_sub=None,
         **kwargs,
     ):
         # Fast-path: with no fusion feature active this is numerically and structurally
@@ -105,6 +150,11 @@ class FusionHyperNetwork(HyperNetwork):
             tr = self.traj_proj(traj_embeds.to(param_dtype))
             if traj_marks is not None:
                 tr = tr + self.traj_mark_embedding(traj_marks.to(device))
+            if self.traj_pos_emb != "none" and traj_pos is not None:
+                tr = tr + self.traj_pos_embedding(self._pos_rows(traj_pos.to(device)))
+            if self.traj_sub_emb and traj_sub is not None:
+                sub = traj_sub.to(device).clamp_(0, self.traj_sub_embedding.num_embeddings - 1)
+                tr = tr + self.traj_sub_embedding(sub)
             seq_parts.append(tr)
             if traj_mask is not None:
                 pad_parts.append(traj_mask.to(device))

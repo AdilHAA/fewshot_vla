@@ -14,11 +14,29 @@ def norm_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
+from src.traj_data.cache_io import HEADER_DEFAULTS
+
+# Header keys introduced 2026-08-02. Caches written before that lack them, so the
+# knowable ones are back-filled with what those builds implicitly had — otherwise
+# every pre-existing cache would fail `assert_header_matches` on `None != "all"`.
+# `chunk`/`encoder_model` are back-filled with the UNRECORDED sentinels instead:
+# their real values cannot be recovered, so pinning them against an old cache is
+# meant to fail rather than silently "match".
+_UNRECORDED = {"chunk": 0, "encoder_model": ""}
+
+
 class TrajCache:
     def __init__(self, out_dir: str):
         with open(os.path.join(out_dir, "index.json")) as fh:
             meta = json.load(fh)
         self.header = meta["header"]
+        for k, v in {**HEADER_DEFAULTS, **_UNRECORDED}.items():
+            self.header.setdefault(k, v)
+        # tokens_per_unit is DERIVABLE from the format tag, so no cache ever needs a
+        # rebuild for it — unlike chunk/encoder_model, which are genuinely lost.
+        if not self.header.get("tokens_per_unit"):
+            from src.traj_data.encoder import parse_format
+            self.header["tokens_per_unit"] = parse_format(self.header["format"])["tokens_per_unit"]
         self.records = meta["records"]
         self._d = int(self.header["d_enc"])
         total = sum(r["length"] for r in self.records)

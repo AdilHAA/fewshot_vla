@@ -234,13 +234,25 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         return torch.cat(toks, dim=1)
 
     def _dino_features(self, batch: Dict[str, Tensor]) -> Tensor:
-        """Patch tokens from the external frozen DINOv2 on the main frame.
-        Returns (B, 1 + num_patches, dino_hidden). Computed without grad."""
+        """Tokens from the external frozen DINOv2 on the main frame.
+
+        Default `hn_dino_tokens="all"` returns the full (B, 1+n_reg+num_patches,
+        dino_hidden) sequence — unchanged. `"cls"` keeps only the global token, which
+        is the dummy-ablation arm: it asks whether the HN needs any spatial detail of
+        the start frame at all. Note the DINO forward itself costs the same either
+        way — the patches are computed and then dropped — so this arm is motivated by
+        the question, not by compute."""
         img = self._first_image(batch).to(self._dino_mean.dtype)
         img = F.interpolate(img, size=(224, 224), mode="bilinear", align_corners=False)
         img = (img - self._dino_mean) / self._dino_std
         out = self.dino(pixel_values=img.to(self.dino.dtype))
-        return out.last_hidden_state
+        hs = out.last_hidden_state
+        mode = getattr(self.config, "hn_dino_tokens", "all")
+        if mode == "all":
+            return hs
+        if mode == "cls":
+            return hs[:, :1]
+        raise ValueError(f"hn_dino_tokens must be 'all' or 'cls', got {mode!r}")
 
     def _embed_language(self, lang_tokens: Tensor) -> Tensor:
         return self.model.vlm_with_expert.embed_language_tokens(lang_tokens)

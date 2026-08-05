@@ -39,10 +39,38 @@
 #   P_SELF     ()                    explicit hn_p_self override (e.g. 0.5 mix)
 #   K          (1)                   context size (demos/frames per sample)
 #   VGRID      (2)                   traj+vjepa2: s×s spatial tokens per tubelet
+#   TSEL       (all)                 traj: temporal scope of a cached record —
+#                                     all | first (minimal-clip arm)
+#   TNF        (0)                   traj, TSEL=first: frames kept per record
+#   TFILL      ()                    traj, TSEL=first: dup | zero (how the short
+#                                     clip was padded to the encoder minimum)
+#   TENC_MODEL ()                    traj: pin the HF encoder id the cache was
+#                                     built with (empty = don't check)
+#   TCHUNK     (0)                   traj: pin the encode window of the cache
+#                                     (empty/0 = don't check)
+#   DPATCH     (0)                   traj+dino: 1 = keep ALL 256 patch tokens of
+#                                     every frame, unpooled (257 tokens/frame)
+#   DGRID      (0)                   traj+dino: block-average the 16x16 patch map
+#                                     to s×s tokens. DPATCH=1 is the s=16 case,
+#                                     where the block is 1x1 and pooling is a no-op.
+#   DREG       (0)                   traj+dino: register tokens per frame
+#                                     (dinov2-with-registers checkpoints only)
+#   TPOS       (none)                traj: temporal position code for the clip —
+#                                     none | index | phase
+#   TSUB       (0)                   traj: 1 = also embed the token's index WITHIN
+#                                     its frame/tubelet (needed to interpret a null
+#                                     result on the patch/register arms)
+#   DTOK       (all)                 vision: DINO tokens fed to the HN — all | cls
 #   BANK       (outputs/frame_bank.npz)  vision mode, PAIR=same|cross: first-frame
 #                                     bank path (build with the frame-bank script)
-#   VLM        (1)                   vision mode: 1 = condition HN on the VLM's own
-#                                     image tokens; 0 = no VLA embedding (arm A3/A4)
+#   VLM        (1)                   1 = also condition the HN on the VLM's own
+#                                     image tokens (SigLIP of the frozen SmolVLM).
+#                                     Applies to BOTH vision and traj modes. In traj
+#                                     it requires $BANK: the conditioning frame must
+#                                     be a t=0 bank frame on train, or the stream
+#                                     would see a random step on train and t=0 at
+#                                     eval. Historical default: ON in vision, absent
+#                                     in traj — hence the _vlm / _novlm suffixes.
 #   WANDB      (1)                    1 = enable wandb logging
 #   WANDB_PROJECT (hyper-lora)        wandb project name
 #   WANDB_OFFLINE (0)                 1 = log wandb locally without network/login
@@ -74,8 +102,30 @@ PAIR="${PAIR:-cross}"
 P_SELF="${P_SELF:-}"
 K="${K:-1}"
 VGRID="${VGRID:-2}"
+TSEL="${TSEL:-all}"
+TNF="${TNF:-0}"
+TFILL="${TFILL:-}"
+TENC_MODEL="${TENC_MODEL:-}"
+TCHUNK="${TCHUNK:-0}"
+DPATCH="${DPATCH:-0}"
+DGRID="${DGRID:-0}"
+[ "$DPATCH" = "1" ] && DGRID=16
+DREG="${DREG:-0}"
+TPOS="${TPOS:-none}"
+TSUB="${TSUB:-0}"
+DTOK="${DTOK:-all}"
 # PAIR sugar -> p_self (explicit P_SELF wins); "loo" is an alias of "cross".
 case "$PAIR" in loo) PAIR=cross ;; esac
+# These four now feed the output DIRECTORY NAME, so a typo would silently create a
+# new arm instead of failing. Validate before anything uses them.
+case "$PAIR"  in same|cross|obs) ;; *) echo "ERROR: PAIR must be same|cross|loo|obs, got '$PAIR'" >&2; exit 1 ;; esac
+case "$TSEL"  in all|first)      ;; *) echo "ERROR: TSEL must be all|first, got '$TSEL'" >&2; exit 1 ;; esac
+case "$TFILL" in ""|dup|zero)    ;; *) echo "ERROR: TFILL must be empty|dup|zero, got '$TFILL'" >&2; exit 1 ;; esac
+case "$TPOS"  in none|index|phase) ;; *) echo "ERROR: TPOS must be none|index|phase, got '$TPOS'" >&2; exit 1 ;; esac
+case "$DTOK"  in all|cls)        ;; *) echo "ERROR: DTOK must be all|cls, got '$DTOK'" >&2; exit 1 ;; esac
+if [ "$TSEL" = "first" ] && [ "$TNF" -lt 1 ]; then
+    echo "ERROR: TSEL=first requires TNF>=1, got '$TNF'" >&2; exit 1
+fi
 if [ -z "$P_SELF" ]; then
     case "$PAIR" in
         same)  P_SELF=1.0 ;;
@@ -109,6 +159,43 @@ esac
 [ "$AUG" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_aug"
 [ "$EXPERT" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_expert"
 [ "$MODE" = "traj" ] && [ "$KV" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_kv"
+# CONDITIONING knobs must appear in the name too. Without this, arms that differ
+# only by pairing / context size / token format map to the SAME default dir — the
+# run then either aborts on the pre-exist check below or, with RESUME=1, writes
+# into a different arm's checkpoint. (This already collided B1<->B2 and A3<->A4.)
+# A suffix is added ONLY when a knob is off its default, exactly like the
+# RANK/SEED/AUG lines above — so the fully default invocation of each mode keeps
+# its historical path and RESUME=1 still finds those checkpoints. A run that used
+# a NON-default knob before this change did share a path with its siblings; to
+# resume one of those, pass OUTPUT=… explicitly.
+case "$MODE" in
+    vision)
+        if [ "$PAIR" = "obs" ]; then DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_obs"
+        elif [ "$P_SELF" != "0.0" ]; then DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_p${P_SELF}"; fi
+        [ "$VLM" = "0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_novlm"
+        [ "$DTOK" != "all" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${DTOK}" ;;
+    traj)
+        [ "$P_SELF" != "0.0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_p${P_SELF}"
+        [ "$K" != "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_k${K}"
+        [ "$ENC" = "vjepa2" ] && [ "$VGRID" != "2" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_g${VGRID}"
+        [ "$TSEL" != "all" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${TSEL}${TNF}${TFILL}"
+        [ "$DGRID" = "16" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_patches"
+        [ "$DGRID" != "0" ] && [ "$DGRID" != "16" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_dg${DGRID}"
+        [ "$DREG" != "0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_reg${DREG}"
+        [ "$TPOS" != "none" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${TPOS}"
+        [ "$TSUB" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_sub"
+        [ "$VLM" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_vlm"
+        # A different cache IS a different arm (TENC_MODEL/TCHUNK only *assert*
+        # provenance; XPAIR_CACHE is what actually selects the data). Skipped when
+        # the flags above already spell the cache name out.
+        if [ "$XPAIR_CACHE" != "outputs/xpair_cache/$ENC" ]; then
+            CACHE_TAG="$(basename "$XPAIR_CACHE")"
+            case "$DEFAULT_OUTPUT" in
+                *"$CACHE_TAG"*) : ;;
+                *) DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${CACHE_TAG}" ;;
+            esac
+        fi ;;
+esac
 OUTPUT="${OUTPUT:-$DEFAULT_OUTPUT}"
 
 if [ "$RESUME" = "1" ]; then
@@ -143,6 +230,7 @@ case "$MODE" in
             --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
             --policy.hn_use_dino=true
             --policy.hn_dino_model_id="$DINO_ID"
+            --policy.hn_dino_tokens="$DTOK"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"
         )
@@ -171,7 +259,13 @@ case "$MODE" in
         # offline cache. Build it first with scripts/build_xpair_cache.py.
         if [ ! -d "$XPAIR_CACHE" ]; then
             echo "ERROR: traj cache '$XPAIR_CACHE' not found — build it first:" >&2
-            echo "       python scripts/build_xpair_cache.py --out $XPAIR_CACHE ..." >&2
+            echo "       bash scripts/build_all_caches.sh" >&2
+            exit 1
+        fi
+        if [ "$VLM" = "1" ] && [ ! -f "$BANK" ]; then
+            echo "ERROR: VLM=1 in traj mode needs the t=0 frame bank '$BANK'." >&2
+            echo "       Build it: python scripts/build_frame_bank.py --out $BANK" >&2
+            echo "       (or run with VLM=0 to drop the VLM stream)" >&2
             exit 1
         fi
         MODE_ARGS+=(
@@ -179,13 +273,32 @@ case "$MODE" in
             --policy.hn_use_traj_clip=true
             --policy.hn_xpair_cache_path="$XPAIR_CACHE"
             --policy.hn_traj_encoder="$ENC"
+            --policy.hn_use_vlm_vision=$([ "$VLM" = "1" ] && echo true || echo false)
             --policy.hn_p_self="$P_SELF"
             --policy.hn_context_k="$K"
             --policy.hn_vjepa_grid="$VGRID"
             --policy.hn_inject_vlm_kv="$KV_FLAG"
             --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
             --policy.train_action_expert="$EXPERT_FLAG"
-        ) ;;
+        )
+        # Appended only when actually used, so the command line of every existing
+        # arm stays byte-identical and no empty-string flag reaches the parser.
+        [ "$TSEL" != "all" ] && MODE_ARGS+=(
+            --policy.hn_traj_time_select="$TSEL"
+            --policy.hn_traj_n_frames="$TNF"
+        )
+        [ -n "$TFILL" ] && MODE_ARGS+=(--policy.hn_traj_fill="$TFILL")
+        [ -n "$TENC_MODEL" ] && MODE_ARGS+=(--policy.hn_traj_encoder_model="$TENC_MODEL")
+        [ "$TCHUNK" != "0" ] && MODE_ARGS+=(--policy.hn_traj_chunk="$TCHUNK")
+        [ "$DGRID" != "0" ] && MODE_ARGS+=(--policy.hn_dino_grid="$DGRID")
+        [ "$DREG" != "0" ] && MODE_ARGS+=(--policy.hn_dino_n_reg="$DREG")
+        [ "$TPOS" != "none" ] && MODE_ARGS+=(--policy.hn_traj_pos_emb="$TPOS")
+        [ "$TSUB" = "1" ] && MODE_ARGS+=(--policy.hn_traj_sub_emb=true)
+        # The bank is what keeps the VLM stream's train frame (t=0 of some episode
+        # of the task) in the same distribution as its eval frame (t=0 of the
+        # rollout). Without it the arm measures a train/eval mismatch instead.
+        [ "$VLM" = "1" ] && MODE_ARGS+=(--policy.hn_frame_bank_path="$BANK")
+        : ;;   # the `:` keeps the branch's exit status 0 under `set -e`
 esac
 
 echo "==> Train | mode=$MODE | rank=$RANK | prec=$PREC | batch=$BATCH | seed=$SEED | aug=$AUG_FLAG | expert=$EXPERT_FLAG | wandb=$WANDB_FLAG"

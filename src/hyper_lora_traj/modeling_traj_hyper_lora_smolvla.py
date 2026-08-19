@@ -88,6 +88,39 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         tm = self.hypernet.target_modules
         dino_dim = (int(self.dino.config.hidden_size)
                     if getattr(self, "dino", None) is not None else 0)
+        trunk_model = getattr(config, "hn_trunk_model", "")
+        if trunk_model:
+            from .trunk_qwen35 import TrunkHyperNetwork
+            self._traj_cache.assert_header_matches(
+                encoder_id="qwen35vl",
+                format=f"qwen35vl_stride{int(config.hn_trunk_stride)}",
+                stride=int(config.hn_trunk_stride),
+                encoder_model=trunk_model)
+            self.hypernet = TrunkHyperNetwork(
+                text_embed_dim=self._vlm_text_hidden_size(),
+                hidden_size=config.hn_hidden_size,
+                num_layers=len(self._vlm_text_model().layers),
+                lora_rank=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                target_modules=tm,
+                dropout=config.hn_dropout,
+                encoder_type=config.hn_encoder_type,
+                tf_num_blocks=config.hn_tf_num_blocks,
+                tf_num_heads=config.hn_tf_num_heads,
+                use_vlm_vision=False, vlm_vision_dim=self._vlm_text_hidden_size(),
+                use_dino=False, dino_dim=0,
+                zero_init_up=config.hn_zero_init_up,
+                use_traj=True,
+                traj_dim=int(self._traj_cache.header["d_enc"]),
+                stream_type_emb=False, per_stream_null=False, readout="queries",
+                trunk_model=trunk_model,
+                trunk_dim=int(self._traj_cache.header["d_enc"]),
+                trunk_text=getattr(config, "hn_trunk_text", True),
+                trunk_grad_ckpt=getattr(config, "hn_trunk_grad_ckpt", True),
+            )
+            self._freeze_base()
+            self._traj_gen = torch.Generator().manual_seed(int(config.hn_seed))
+            return
         self.hypernet = FusionHyperNetwork(
             text_embed_dim=self._vlm_text_hidden_size(),
             hidden_size=config.hn_hidden_size,
@@ -187,11 +220,17 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
                 (traj_embeds, traj_mask, traj_marks,
                  traj_pos, traj_sub) = self._build_traj_conditioning(batch)
 
-        weights = self.hypernet(
-            text_embeds, lang_masks, vlm_vision_embeds, dino_embeds,
-            traj_embeds=traj_embeds, traj_mask=traj_mask, traj_marks=traj_marks,
-            traj_pos=traj_pos, traj_sub=traj_sub,
-        )
+        if getattr(self.config, "hn_trunk_model", ""):
+            # The trunk eats cached VIDEO tokens + the raw instruction string; the
+            # SmolVLA text embeds / marks / pos built above are unused here.
+            texts = self._trunk_texts(batch)
+            weights = self.hypernet.forward_trunk(traj_embeds, traj_mask, texts)
+        else:
+            weights = self.hypernet(
+                text_embeds, lang_masks, vlm_vision_embeds, dino_embeds,
+                traj_embeds=traj_embeds, traj_mask=traj_mask, traj_marks=traj_marks,
+                traj_pos=traj_pos, traj_sub=traj_sub,
+            )
         if os.environ.get("HN_LOG_LORA"):
             self._log_lora_drift(weights)
         self._set_lora_weights(weights)
@@ -223,6 +262,20 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         logger.warning("[TRAJ] task=%d demos=%d tokens=%d",
                        task_index, len(demos), packed[0].shape[1])
         return tuple(x.to(dev) for x in packed)
+
+    def _trunk_texts(self, batch: Dict[str, Tensor]) -> list[str]:
+        """Instruction STRING per sample (the trunk has its own tokenizer)."""
+        if self.training:
+            tis = batch["task_index"]
+            tis = tis.tolist() if hasattr(tis, "tolist") else list(tis)
+        else:
+            tis = [self._resolve_eval_task(batch)] * batch[OBS_LANGUAGE_TOKENS].shape[0]
+        texts = self._traj_cache.header.get("task_texts") or {}
+        # task_texts keys are strings after the json round-trip
+        out = [texts.get(str(t), "") for t in tis]
+        if any(not x for x in out):
+            logger.warning("[TRUNK] empty instruction for tasks %s", tis)
+        return out
 
     def _resolve_eval_task(self, batch: Dict[str, Tensor]) -> int:
         """Base-task lookup: batch task_index when present, else the instruction

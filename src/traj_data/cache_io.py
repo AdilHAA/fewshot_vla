@@ -32,6 +32,9 @@ class CacheHeader:
     # Pinning `chunk` therefore (correctly) refuses to validate such a cache.
     chunk: int = 0
     encoder_model: str = ""    # HF model id; `encoder_id` does NOT identify weights
+    # Uniform stride budget used at build time (qwen35vl caches); 0 = full clip.
+    # The scratch-control derivation must match this value.
+    stride: int = 0
 
 
 # Header keys that must agree for two shards to belong to the same cache. `d_enc`

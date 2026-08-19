@@ -61,6 +61,15 @@
 #                                     its frame/tubelet (needed to interpret a null
 #                                     result on the patch/register arms)
 #   DTOK       (all)                 vision: DINO tokens fed to the HN — all | cls
+#   TRUNK      ()                    traj: HF id of a pretrained trunk (e.g.
+#                                     Qwen/Qwen3.5-0.8B) that replaces the scratch
+#                                     hypernetwork — frozen Qwen3.5 text stack over
+#                                     CACHED video tokens + instruction + 32 learned
+#                                     layer tokens. Requires the qwen35vl cache
+#                                     (build_qwen35_video_cache.py). Empty = off.
+#   TSTRIDE    (32)                  trunk: stride frames per demo (whole clip)
+#   TEXT       (1)                   trunk: 1 = include the instruction in the trunk
+#                                     input, 0 = video tokens only
 #   BANK       (outputs/frame_bank.npz)  vision mode, PAIR=same|cross: first-frame
 #                                     bank path (build with the frame-bank script)
 #   VLM        (1)                   1 = also condition the HN on the VLM's own
@@ -114,6 +123,9 @@ DREG="${DREG:-0}"
 TPOS="${TPOS:-none}"
 TSUB="${TSUB:-0}"
 DTOK="${DTOK:-all}"
+TRUNK="${TRUNK:-}"
+TSTRIDE="${TSTRIDE:-32}"
+TEXT="${TEXT:-1}"
 # --- overfit / training-extension knobs (direction 6) ---------------------------
 # EPISODES: train on ONLY these dataset episodes (single-task overfit). Format is a
 # python list, e.g. EPISODES="[57,58,59]"; empty = whole dataset (the old behaviour,
@@ -197,6 +209,11 @@ case "$MODE" in
         [ "$TPOS" != "none" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${TPOS}"
         [ "$TSUB" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_sub"
         [ "$VLM" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_vlm"
+        if [ -n "$TRUNK" ]; then
+            short="$(basename "$TRUNK" | tr 'A-Z' 'a-z')"
+            DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_trunk_${short}_s${TSTRIDE}"
+            [ "$TEXT" = "0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_notext"
+        fi
         # A different cache IS a different arm (TENC_MODEL/TCHUNK only *assert*
         # provenance; XPAIR_CACHE is what actually selects the data). Skipped when
         # the flags above already spell the cache name out.
@@ -336,6 +353,13 @@ case "$MODE" in
         # of the task) in the same distribution as its eval frame (t=0 of the
         # rollout). Without it the arm measures a train/eval mismatch instead.
         [ "$VLM" = "1" ] && MODE_ARGS+=(--policy.hn_frame_bank_path="$BANK")
+        if [ -n "$TRUNK" ]; then
+            MODE_ARGS+=(
+                --policy.hn_trunk_model="$TRUNK"
+                --policy.hn_trunk_stride="$TSTRIDE"
+                --policy.hn_trunk_text="$([ "$TEXT" = "1" ] && echo true || echo false)"
+            )
+        fi
         : ;;   # the `:` keeps the branch's exit status 0 under `set -e`
 esac
 

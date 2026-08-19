@@ -65,6 +65,15 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     hn_traj_sub_emb: bool = False        # index of the token WITHIN its frame/tubelet
     hn_traj_pos_std: float = 0.02        # init std; fixed so index/phase start equal
 
+    # --- Direction 7: pretrained trunk instead of the scratch hypernetwork ----------
+    # Empty (default) => FusionHyperNetwork exactly as before; every existing arm,
+    # command and checkpoint is untouched. Set to a Qwen3.5 HF id to condition via
+    # its frozen text stack over CACHED video tokens + instruction + 32 layer tokens.
+    hn_trunk_model: str = ""
+    hn_trunk_text: bool = True       # include the instruction in the trunk input
+    hn_trunk_grad_ckpt: bool = True  # required: activations for the layer tokens
+    hn_trunk_stride: int = 32        # frames per demo (uniform stride, whole clip)
+
     # --- HN fusion extras (neutral => FusionHyperNetwork fast-path == parent) ---------
     hn_stream_type_emb: bool = False
     hn_per_stream_null: bool = False

@@ -46,10 +46,12 @@ def slope(steps, values, lo: float, hi: float):
     return (n * sxy - sx * sy) / denom, n
 
 
-def analyse(run_dir: str, decay: int, windows=((10_000, 30_000), (30_000, 1e9))):
+def analyse(run_dir: str, decay: int, windows=None):
     tb = os.path.join(run_dir, "tensorboard")
     if not os.path.isdir(tb):
         return f"{run_dir}: no tensorboard/ (arm trained without TB=1?)", False
+    if windows is None:
+        windows = ((10_000, 30_000), (30_000, 1e9))
     loss = read_scalars(tb, "train/loss")
     if loss is None:
         return f"{run_dir}: no train/loss scalar", False
@@ -91,14 +93,25 @@ def main(argv=None):
     p.add_argument("runs", nargs="+", help="run dirs (contain tensorboard/)")
     p.add_argument("--decay", type=float, default=30_000,
                    help="scheduler decay horizon (default 30000, the SmolVLA preset)")
+    p.add_argument("--windows", default="",
+                   help="explicit slope windows 'lo:hi ...' in steps, e.g. "
+                        "'10000:30000 30000:100000 100000:120000' — for measuring "
+                        "an extended run's post-resume segment")
     args = p.parse_args(argv)
+
+    windows = ((10_000, 30_000), (30_000, 1e9))
+    if args.windows:
+        windows = []
+        for w in args.windows.split():
+            lo, hi = w.split(":")
+            windows.append((float(lo), float(hi) if hi != "end" else 1e9))
 
     dirs = []
     for r in args.runs:
         dirs.extend(sorted(glob.glob(r)) or [r])
     ok = False
     for d in dirs:
-        text, found = analyse(d, args.decay)
+        text, found = analyse(d, args.decay, windows)
         print(text, file=sys.stdout if found else sys.stderr)
         ok = ok or found
     return 0 if ok else 1

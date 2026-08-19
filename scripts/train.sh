@@ -114,6 +114,18 @@ DREG="${DREG:-0}"
 TPOS="${TPOS:-none}"
 TSUB="${TSUB:-0}"
 DTOK="${DTOK:-all}"
+# --- overfit / training-extension knobs (direction 6) ---------------------------
+# EPISODES: train on ONLY these dataset episodes (single-task overfit). Format is a
+# python list, e.g. EPISODES="[57,58,59]"; empty = whole dataset (the old behaviour,
+# byte-identical argv). Build the list for a task with scripts/pick_task.py.
+# NO quotes inside the value: draccus rejects '"[57]"' for a list[int] field.
+EPISODES="${EPISODES:-}"
+# SCHED_DECAY: the SmolVLA lr preset floors at scheduler_decay_lr (2.5e-6) after
+# scheduler_decay_steps=30k and does NOT scale with --steps, so steps 30k-100k of
+# every run so far trained at 2.5% of peak lr. Set this when EXTENDING a run
+# (STEPS > its trained steps) so the cosine spans the new horizon instead.
+# Empty = don't touch the scheduler (the old behaviour).
+SCHED_DECAY="${SCHED_DECAY:-}"
 # PAIR sugar -> p_self (explicit P_SELF wins); "loo" is an alias of "cross".
 case "$PAIR" in loo) PAIR=cross ;; esac
 # These four now feed the output DIRECTORY NAME, so a typo would silently create a
@@ -204,8 +216,25 @@ if [ "$RESUME" = "1" ]; then
         echo "ERROR: $CONFIG not found — nothing to resume." >&2
         exit 1
     fi
-    echo "==> Resuming $OUTPUT from $(readlink -f "$OUTPUT/checkpoints/last") | save_freq=$SAVE_FREQ"
-    exec python train_hyper_lora.py --config_path="$CONFIG" --resume=true --save_freq="$SAVE_FREQ"
+    # lerobot reads `steps` from the SAVED config on resume (the loop is
+    # range(saved_step, cfg.steps)), so plain RESUME=1 cannot extend a run: it would
+    # "finish" instantly at its old step count. Pass --steps ONLY when the caller
+    # asks for a different horizon — otherwise the argv stays exactly as before.
+    RESUME_ARGS=()
+    CFG_STEPS="$(python -c "import json;print(json.load(open('$CONFIG')).get('steps'))" 2>/dev/null || echo "?")"
+    if [ "$STEPS" != "$CFG_STEPS" ]; then
+        RESUME_ARGS+=(--steps="$STEPS")
+        if [ -z "$SCHED_DECAY" ]; then
+            echo "WARNING: extending $CFG_STEPS -> $STEPS steps WITHOUT SCHED_DECAY." >&2
+            echo "         The lr preset floors at 2.5e-6 after its decay horizon; the" 2>&1
+            echo "         extension would train at a dead lr. Recommended:" >&2
+            echo "         SCHED_DECAY=$((STEPS * 3 / 10)) STEPS=$STEPS RESUME=1 ..." >&2
+        fi
+    fi
+    [ -n "$SCHED_DECAY" ] && RESUME_ARGS+=(--policy.scheduler_decay_steps="$SCHED_DECAY")
+    echo "==> Resuming $OUTPUT from $(readlink -f "$OUTPUT/checkpoints/last") | save_freq=$SAVE_FREQ | steps=$STEPS (config: $CFG_STEPS)"
+    # shellcheck disable=SC2068
+    exec python train_hyper_lora.py --config_path="$CONFIG" --resume=true --save_freq="$SAVE_FREQ" ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}
 fi
 
 if [ -e "$OUTPUT" ]; then
@@ -317,6 +346,8 @@ python train_hyper_lora.py \
     --dataset.repo_id=lerobot/libero \
     --dataset.use_imagenet_stats=false \
     --dataset.image_transforms.enable="$AUG_FLAG" \
+    ${EPISODES:+--dataset.episodes=$EPISODES} \
+    ${SCHED_DECAY:+--policy.scheduler_decay_steps=$SCHED_DECAY} \
     --policy.push_to_hub=false \
     --policy.device=cuda \
     --steps="$STEPS" \

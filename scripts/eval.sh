@@ -35,6 +35,20 @@ SEEDS="${SEEDS:-1000 2000 3000}"
 EPISODES="${EPISODES:-50}"
 BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
+# TASK_IDS: evaluate only these task ids WITHIN each suite (single-task check, e.g.
+# the overfit diagnostic). Format is a python list: TASK_IDS="[3]". NO quotes inside.
+# A 1-task cell would permanently shadow the full-suite cell of the same
+# label/suite/seed (the skip-check below keys on eval_info.json existing), so it is
+# REFUSED in the default OUT_ROOT — point OUT_ROOT at a separate tree.
+TASK_IDS="${TASK_IDS:-}"
+if [ -n "$TASK_IDS" ] && [ "$OUT_ROOT" = "outputs/eval_matrix" ]; then
+    echo "ERROR: TASK_IDS=$TASK_IDS with the default OUT_ROOT would write a 1-task cell" >&2
+    echo "       into outputs/eval_matrix/<label>/<suite>/seed_N — which then permanently" >&2
+    echo "       shadows that label's future FULL-suite cell (the skip-check only tests" >&2
+    echo "       for eval_info.json). Use a separate tree, e.g.:" >&2
+    echo "       OUT_ROOT=outputs/eval_matrix_1task TASK_IDS=\"$TASK_IDS\" bash scripts/eval.sh" >&2
+    exit 1
+fi
 [ "${EPISODE_CACHE:-1}" != "0" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
 
 # Guard: refuse to start if the GPU is already busy (avoids two-process OOM).
@@ -63,10 +77,12 @@ for entry in $POLICIES; do
             fi
             # An existing dir without eval_info.json is a crashed cell; redo it.
             rm -rf "$cell"
-            echo "==> eval [$label | $task | seed=$seed] | episodes=$EPISODES | batch=$BATCH"
+            echo "==> eval [$label | $task | seed=$seed] | episodes=$EPISODES | batch=$BATCH${TASK_IDS:+ | task_ids=$TASK_IDS}"
+            # shellcheck disable=SC2086
             python eval_hyper_lora.py \
                 --policy.path="$path" \
                 --env.type=libero --env.task="$task" \
+                ${TASK_IDS:+--env.task_ids=$TASK_IDS} \
                 --eval.n_episodes="$EPISODES" --eval.batch_size="$BATCH" \
                 --seed="$seed" \
                 --policy.device=cuda --policy.use_amp=false \

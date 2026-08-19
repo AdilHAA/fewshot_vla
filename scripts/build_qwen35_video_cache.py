@@ -5,13 +5,15 @@ merger outputs LLM-dim tokens, so the visual token sequence of a demo is a pure
 function of its frames. This encodes every episode ONCE into the same ragged cache
 format the dino/vjepa arms already use; training then runs only the frozen text stack.
 
-Temporal coverage: the WHOLE episode is kept at a lower frame rate — a uniform stride
-(`stride_indices`) selects `--frames` frames from start to end, never a truncating
-window. The same index function derives the scratch control's strided dino CLS cache,
-so the trunk arm and its control see bit-identical frames.
+Temporal coverage: every `--every`-th frame, first to last — a FIXED INTERVAL, so
+every episode is conditioned at the SAME temporal resolution and the token count
+scales with clip length (a fixed frame budget would silently give long episodes a
+worse resolution than short ones). The same index function derives the scratch
+control's strided dino CLS cache, so the trunk arm and its control see bit-identical
+frames.
 
-  python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen35vl_s32 \
-      --frames 32                      # shard with --shard/--num_shards as usual
+  python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen35vl_e4 \
+      --every 4                       # shard with --shard/--num_shards as usual
 """
 from __future__ import annotations
 
@@ -36,12 +38,14 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 FRAME_SIZE = 224
 
 
-def encode_frames(model, processor, frames: torch.Tensor, frames_budget: int):
+def encode_frames(model, processor, frames: torch.Tensor, every: int):
     """frames (T,C,H,W) in [0,1] -> (tokens (L, d_llm) fp16, n_frames_used).
 
-    Stride-selects `frames_budget` frames over the WHOLE clip, resizes to FRAME_SIZE,
-    and runs the frozen vision tower + merger (no_grad: nothing inside is trained)."""
-    idx = stride_indices(frames.shape[0], frames_budget)
+    Keeps every `every`-th frame (first to last included) — a fixed INTERVAL, so the
+    temporal resolution is identical for every episode; the token count then scales
+    with clip length. Resizes to FRAME_SIZE and runs the frozen vision tower + merger
+    (no_grad: nothing inside is trained)."""
+    idx = stride_indices(frames.shape[0], every)
     sel = frames[list(idx)]                                   # (N,C,H,W)
     sel = torch.nn.functional.interpolate(
         sel, size=(FRAME_SIZE, FRAME_SIZE), mode="bilinear", align_corners=False)
@@ -62,8 +66,9 @@ def main(argv=None):  # pragma: no cover (GPU/weights)
     p.add_argument("--revision", default="v3.0")
     p.add_argument("--out", required=True)
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--frames", type=int, default=32,
-                   help="stride budget per episode (even; whole episode covered)")
+    p.add_argument("--every", type=int, default=4,
+                   help="keep every k-th frame (fixed interval: same temporal "
+                        "resolution for every episode; token count scales with length)")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--workers", type=int, default=12)
@@ -82,11 +87,11 @@ def main(argv=None):  # pragma: no cover (GPU/weights)
                               args.num_shards, workers=args.workers)
     out_dir = (f"{args.out}.shard{args.shard}" if args.num_shards > 1 else args.out)
     d_enc = int(model.config.text_config.hidden_size)
-    fmt = f"qwen35vl_stride{args.frames}"
+    fmt = f"qwen35vl_every{args.every}"
     writer, task_texts, n = None, {}, 0
     for ep in episodes:
         task_texts.setdefault(int(ep["task_index"]), ep["instruction"])
-        toks, used = encode_frames(model, processor, ep["frames"], args.frames)
+        toks, used = encode_frames(model, processor, ep["frames"], args.every)
         if writer is None:
             writer = CacheWriter(out_dir, int(toks.shape[-1]))
         writer.add(toks, {"episode": ep["episode"], "variant": 0,
@@ -98,8 +103,8 @@ def main(argv=None):  # pragma: no cover (GPU/weights)
         raise RuntimeError("no episodes produced")
     header = CacheHeader(encoder_id="qwen35vl", format=fmt, d_enc=d_enc, aug_set="orig",
                          num_records=0, chunk=0, encoder_model=args.model,
-                         tokens_per_unit=0)          # set from the first record below
-    header.stride = args.frames
+                         tokens_per_unit=49)         # 7x7 merged tokens per temporal pair @224px
+    header.stride = args.every
     total = writer.close(header, task_texts)
     print(f"wrote {len(writer.records)} records ({total} tokens, format={fmt}) "
           f"to {out_dir}")

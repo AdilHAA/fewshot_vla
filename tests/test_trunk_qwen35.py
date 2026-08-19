@@ -21,6 +21,7 @@ for pkgname, rel in [("src", "src"), ("src.hyper_lora", "src/hyper_lora"),
         sys.modules[pkgname] = pkg
 
 from src.hyper_lora_traj.trunk_qwen35 import TrunkHyperNetwork
+import numpy as np
 from src.traj_data.stride import stride_indices, stride_slice
 
 D, HID, NL = 32, 16, 4          # trunk dim / head dim / num layer tokens
@@ -69,17 +70,22 @@ def _flat(hn, toks, pad, texts):
     return torch.cat([t.flatten() for pl in w.values() for pair in pl.values() for t in pair])
 
 
-def test_stride_covers_whole_clip_and_is_even():
-    idx = stride_indices(140, 32)
-    assert len(idx) <= 32 and idx[0] == 0 and idx[-1] == 139   # start AND end kept
-    assert len(idx) % 2 == 0                                    # temporal pairs
-    assert list(idx) == sorted(set(idx.tolist()))
-    assert list(stride_indices(10, 32)) == list(range(10))      # short clip: all
-    assert stride_indices(7, 3).shape[0] == 4                   # odd budget rounds up
+def test_stride_is_fixed_interval_not_fixed_budget():
+    # every k-th frame: SAME resolution for every episode, endpoints kept, even count
+    for T in (75, 140, 289, 505):
+        idx = stride_indices(T, 4)
+        assert idx[0] == 0 and idx[-1] == T - 1 and len(idx) % 2 == 0
+        gaps = np.diff(idx)
+        assert gaps.max() <= 8                       # k, the closing gap, and at most
+        # one double-gap where the even-count correction dropped a frame
+    short = stride_indices(6, 4)
+    assert short[0] == 0 and short[-1] == 5 and len(short) % 2 == 0
+    assert list(stride_indices(20, 1)) == list(range(20))       # k=1 keeps everything
+    # tokens now SCALE with length (fixed budget would have flattened this to 32)
+    assert len(stride_indices(505, 4)) > len(stride_indices(140, 4)) > len(stride_indices(75, 4))
     # the scratch control slices the SAME frames from the dino cache
-    import numpy as np
-    cls = np.arange(140)
-    assert list(stride_slice(cls, 32)) == list(cls[stride_indices(140, 32)])
+    cls = np.arange(505)
+    assert list(stride_slice(cls, 4)) == list(cls[stride_indices(505, 4)])
 
 
 def test_output_contract_matches_every_hypernetwork():
@@ -125,7 +131,7 @@ def test_text_toggles_on_and_off():
     assert not torch.allclose(on, off)
 
 
-RUN = [test_stride_covers_whole_clip_and_is_even,
+RUN = [test_stride_is_fixed_interval_not_fixed_budget,
        test_output_contract_matches_every_hypernetwork,
        test_left_pad_slots_cannot_reach_the_readout,
        test_gradients_reach_queries_and_proj_but_not_trunk,

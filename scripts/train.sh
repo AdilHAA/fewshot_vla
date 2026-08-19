@@ -67,7 +67,9 @@
 #                                     CACHED video tokens + instruction + 32 learned
 #                                     layer tokens. Requires the qwen35vl cache
 #                                     (build_qwen35_video_cache.py). Empty = off.
-#   TSTRIDE    (32)                  trunk: stride frames per demo (whole clip)
+#   TSTRIDE    (4)                   trunk: keep every k-th frame of the demo (a
+#                                     FIXED interval — same temporal resolution for
+#                                     every episode; token count scales with length)
 #   TEXT       (1)                   trunk: 1 = include the instruction in the trunk
 #                                     input, 0 = video tokens only
 #   BANK       (outputs/frame_bank.npz)  vision mode, PAIR=same|cross: first-frame
@@ -124,7 +126,7 @@ TPOS="${TPOS:-none}"
 TSUB="${TSUB:-0}"
 DTOK="${DTOK:-all}"
 TRUNK="${TRUNK:-}"
-TSTRIDE="${TSTRIDE:-32}"
+TSTRIDE="${TSTRIDE:-4}"
 TEXT="${TEXT:-1}"
 # --- overfit / training-extension knobs (direction 6) ---------------------------
 # EPISODES: train on ONLY these dataset episodes (single-task overfit). Format is a
@@ -211,7 +213,7 @@ case "$MODE" in
         [ "$VLM" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_vlm"
         if [ -n "$TRUNK" ]; then
             short="$(basename "$TRUNK" | tr 'A-Z' 'a-z')"
-            DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_trunk_${short}_s${TSTRIDE}"
+            DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_trunk_${short}_e${TSTRIDE}"
             [ "$TEXT" = "0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_notext"
         fi
         # A different cache IS a different arm (TENC_MODEL/TCHUNK only *assert*

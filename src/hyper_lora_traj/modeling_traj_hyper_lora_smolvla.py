@@ -93,7 +93,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             from .trunk_qwen35 import TrunkHyperNetwork
             self._traj_cache.assert_header_matches(
                 encoder_id="qwen35vl",
-                format=f"qwen35vl_stride{int(config.hn_trunk_stride)}",
+                format=f"qwen35vl_every{int(config.hn_trunk_stride)}",
                 stride=int(config.hn_trunk_stride),
                 encoder_model=trunk_model)
             self.hypernet = TrunkHyperNetwork(

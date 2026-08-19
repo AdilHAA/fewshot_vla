@@ -99,6 +99,14 @@ def parse_format(tag: str) -> dict:
         if fill not in FILLS:
             raise ValueError(f"unknown fill {fill!r} in format {tag!r}")
 
+    if base.startswith("qwen35vl"):                # Qwen3.5 video-token caches
+        # unit = temporal pair (temporal_patch_size=2); at the pinned 224px input the
+        # tower emits a 14x14 patch map -> 7x7 merged = 49 tokens per pair.
+        out = {"unit": "pair", "has_cls": False, "n_reg": 0, "grid": 7,
+               "tokens_per_unit": 49}
+        scope = base.split("_", 2)                  # qwen35vl_every{k}
+        out.update(time_select="all", n_frames=0, fill="")
+        return out
     if base.startswith("tubelet_grid"):
         grid = int(base[len("tubelet_grid"):])
         out = {"unit": "tubelet", "has_cls": False, "n_reg": 0, "grid": grid,

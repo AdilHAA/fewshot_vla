@@ -72,7 +72,7 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     hn_trunk_model: str = ""
     hn_trunk_text: bool = True       # include the instruction in the trunk input
     hn_trunk_grad_ckpt: bool = True  # required: activations for the layer tokens
-    hn_trunk_stride: int = 32        # frames per demo (uniform stride, whole clip)
+    hn_trunk_stride: int = 4         # keep every k-th frame (fixed interval)
 
     # --- HN fusion extras (neutral => FusionHyperNetwork fast-path == parent) ---------
     hn_stream_type_emb: bool = False

@@ -192,6 +192,15 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1,
             s = min(range(num_shards), key=lambda i: load[i])
             owner[ep], load[s] = s, load[s] + length
         plan = [e for e in all_eps if owner[e[0]] == shard]
+        if not plan:
+            # An empty shard means the id is out of range (e.g. --shard 2 --num_shards
+            # 2: valid ids are 0..num_shards-1) — say so instead of dying later with
+            # a bare IndexError from the episode deque.
+            raise ValueError(
+                f"shard {shard} owns 0 episodes: num_shards={num_shards} assigns to "
+                f"shards 0..{num_shards - 1} (loads {load}). If you meant one shard "
+                f"per GPU, pass BOTH the gpu index in CUDA_VISIBLE_DEVICES and the "
+                f"shard index in 0..{num_shards - 1}.")
         print(f"[shard {shard}] {len(plan)} episodes, {sum(e[2] for e in plan)} frames "
               f"(shard loads: {load})", flush=True)
     else:

@@ -118,6 +118,13 @@ class TrunkHyperNetwork(HyperNetwork):
             segs.append(self.layer_queries.to(dtype))
             rows_segs.append(segs)
         Lmax = max(sum(s.shape[0] for s in segs) for segs in rows_segs)
+        # Round the padded length UP to a multiple of 256: sequence lengths vary
+        # batch to batch (880..6200), and every distinct length triggers a fresh
+        # Triton JIT compile inside the trunk (~seconds each, observed as ~27s
+        # stalls every few steps). Bucketing collapses the shape space to ~25
+        # values, so compiles stop after a short warmup. The extra pad slots are
+        # masked and provably cannot reach the readout.
+        Lmax = ((Lmax + 255) // 256) * 256
         rows, masks = [], []
         for segs in rows_segs:
             L = sum(s.shape[0] for s in segs)

@@ -50,6 +50,16 @@ class TrajCache:
             self._by_task.setdefault(r["task_index"], []).append(i)
         self._text_to_task = {norm_text(v): int(k)
                               for k, v in meta.get("task_texts", {}).items()}
+        # task_texts lives at the TOP level of index.json (not in the header): the
+        # trunk arm feeds these STRINGS through its own tokenizer, so expose them
+        # keyed by both str and int (json round-trips keys as strings).
+        self.task_texts: dict = {}
+        for k, v in meta.get("task_texts", {}).items():
+            self.task_texts[str(k)] = v
+            try:
+                self.task_texts[int(k)] = v
+            except (TypeError, ValueError):
+                pass
 
     def assert_header_matches(self, **expected) -> None:
         for k, v in expected.items():

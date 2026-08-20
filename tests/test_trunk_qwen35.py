@@ -159,12 +159,37 @@ def test_trajcache_qwen35vl_header_check():
             pass
 
 
+def test_trajcache_exposes_task_texts():
+    """The trunk feeds instruction STRINGS to its own tokenizer; they come from the
+    cache's top-level task_texts, NOT the header (a header lookup silently returned
+    '' for every task)."""
+    import tempfile
+
+    import numpy as np
+
+    from src.traj_data.cache_io import CacheHeader, CacheWriter
+    from src.traj_data.traj_cache import TrajCache
+
+    with tempfile.TemporaryDirectory() as d:
+        w = CacheWriter(d, 8)
+        w.add(np.zeros((98, 8), np.float16),
+              {"episode": 0, "variant": 0, "task_index": 7, "n_frames": 4})
+        w.close(CacheHeader("qwen35vl", "qwen35vl_every4", 8, "orig", 1,
+                            encoder_model="Qwen/Qwen3.5-0.8B", tokens_per_unit=49,
+                            stride=4), {7: "open the box"})
+        c = TrajCache(d)
+        texts = getattr(c, "task_texts", None) or {}
+        assert texts.get(str(7)) == "open the box"
+        assert c.header.get("task_texts") is None          # they are NOT in the header
+
+
 RUN = [test_stride_is_fixed_interval_not_fixed_budget,
        test_output_contract_matches_every_hypernetwork,
        test_left_pad_slots_cannot_reach_the_readout,
        test_gradients_reach_queries_and_proj_but_not_trunk,
        test_text_toggles_on_and_off,
-       test_trajcache_qwen35vl_header_check]
+       test_trajcache_qwen35vl_header_check,
+       test_trajcache_exposes_task_texts]
 if __name__ == "__main__":
     for fn in RUN:
         fn(); print(f"PASS {fn.__name__}")

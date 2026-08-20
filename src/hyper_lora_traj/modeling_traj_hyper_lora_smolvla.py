@@ -276,7 +276,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             tis = tis.tolist() if hasattr(tis, "tolist") else list(tis)
         else:
             tis = [self._resolve_eval_task(batch)] * batch[OBS_LANGUAGE_TOKENS].shape[0]
-        texts = self._traj_cache.header.get("task_texts") or {}
+        texts = getattr(self._traj_cache, "task_texts", None) or {}
         # task_texts keys are strings after the json round-trip
         out = [texts.get(str(t), "") for t in tis]
         if any(not x for x in out):

@@ -131,11 +131,40 @@ def test_text_toggles_on_and_off():
     assert not torch.allclose(on, off)
 
 
+def test_trajcache_qwen35vl_header_check():
+    """The trunk arm's provenance check accepts the qwen35vl cache and REJECTS the
+    dino one — the old code ran the dino check first and crashed at construction."""
+    import tempfile
+
+    import numpy as np
+
+    from src.traj_data.cache_io import CacheHeader, CacheWriter
+    from src.traj_data.traj_cache import TrajCache
+
+    with tempfile.TemporaryDirectory() as d:
+        w = CacheWriter(d, 8)
+        w.add(np.zeros((98, 8), np.float16),
+              {"episode": 0, "variant": 0, "task_index": 0, "n_frames": 4})
+        w.close(CacheHeader("qwen35vl", "qwen35vl_every4", 8, "orig", 1,
+                            encoder_model="Qwen/Qwen3.5-0.8B", tokens_per_unit=49,
+                            stride=4), {0: "open the box"})
+        c = TrajCache(d)
+        assert c.header["tokens_per_unit"] == 49
+        c.assert_header_matches(encoder_id="qwen35vl", format="qwen35vl_every4",
+                                stride=4, encoder_model="Qwen/Qwen3.5-0.8B")
+        try:
+            c.assert_header_matches(encoder_id="dino", format="cls")
+            raise SystemExit("dino check must reject a qwen35vl cache")
+        except ValueError:
+            pass
+
+
 RUN = [test_stride_is_fixed_interval_not_fixed_budget,
        test_output_contract_matches_every_hypernetwork,
        test_left_pad_slots_cannot_reach_the_readout,
        test_gradients_reach_queries_and_proj_but_not_trunk,
-       test_text_toggles_on_and_off]
+       test_text_toggles_on_and_off,
+       test_trajcache_qwen35vl_header_check]
 if __name__ == "__main__":
     for fn in RUN:
         fn(); print(f"PASS {fn.__name__}")

@@ -54,6 +54,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         super().__init__(config, **kwargs)
         self._traj_cache = None
         traj_dim = 0
+        trunk_model = getattr(config, "hn_trunk_model", "")
         if config.hn_use_traj_clip:
             if not config.hn_xpair_cache_path:
                 raise ValueError("hn_use_traj_clip=True requires hn_xpair_cache_path")
@@ -66,36 +67,41 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             # full-clip config (and vice versa). encoder_model/chunk are opt-in
             # pins: they are invisible in the tokens, so leaving them unset keeps
             # every previously trained checkpoint loadable.
-            expected = {
-                "encoder_id": config.hn_traj_encoder,
-                "format": encoder_format(
-                    config.hn_traj_encoder,
-                    getattr(config, "hn_vjepa_grid", 2),
-                    time_select=getattr(config, "hn_traj_time_select", "all"),
-                    n_frames=getattr(config, "hn_traj_n_frames", 0),
-                    fill=getattr(config, "hn_traj_fill", ""),
-                    dino_grid=getattr(config, "hn_dino_grid", 0),
-                    include_cls=getattr(config, "hn_dino_include_cls", True),
-                    n_reg=getattr(config, "hn_dino_n_reg", 0)),
-            }
-            if getattr(config, "hn_traj_encoder_model", ""):
-                expected["encoder_model"] = config.hn_traj_encoder_model
-            if int(getattr(config, "hn_traj_chunk", 0)):
-                expected["chunk"] = int(config.hn_traj_chunk)
+            if trunk_model:
+                # A trunk arm reads a qwen35vl VIDEO-token cache; the dino/vjepa tag
+                # check below would reject it (encoder_id 'dino', format 'cls') before
+                # the trunk branch ever ran — this check replaces it.
+                expected = {
+                    "encoder_id": "qwen35vl",
+                    "format": f"qwen35vl_every{int(config.hn_trunk_stride)}",
+                    "stride": int(config.hn_trunk_stride),
+                    "encoder_model": trunk_model,
+                }
+            else:
+                expected = {
+                    "encoder_id": config.hn_traj_encoder,
+                    "format": encoder_format(
+                        config.hn_traj_encoder,
+                        getattr(config, "hn_vjepa_grid", 2),
+                        time_select=getattr(config, "hn_traj_time_select", "all"),
+                        n_frames=getattr(config, "hn_traj_n_frames", 0),
+                        fill=getattr(config, "hn_traj_fill", ""),
+                        dino_grid=getattr(config, "hn_dino_grid", 0),
+                        include_cls=getattr(config, "hn_dino_include_cls", True),
+                        n_reg=getattr(config, "hn_dino_n_reg", 0)),
+                }
+                if getattr(config, "hn_traj_encoder_model", ""):
+                    expected["encoder_model"] = config.hn_traj_encoder_model
+                if int(getattr(config, "hn_traj_chunk", 0)):
+                    expected["chunk"] = int(config.hn_traj_chunk)
             self._traj_cache.assert_header_matches(**expected)
             traj_dim = int(self._traj_cache.header["d_enc"])
 
         tm = self.hypernet.target_modules
         dino_dim = (int(self.dino.config.hidden_size)
                     if getattr(self, "dino", None) is not None else 0)
-        trunk_model = getattr(config, "hn_trunk_model", "")
         if trunk_model:
             from .trunk_qwen35 import TrunkHyperNetwork
-            self._traj_cache.assert_header_matches(
-                encoder_id="qwen35vl",
-                format=f"qwen35vl_every{int(config.hn_trunk_stride)}",
-                stride=int(config.hn_trunk_stride),
-                encoder_model=trunk_model)
             self.hypernet = TrunkHyperNetwork(
                 text_embed_dim=self._vlm_text_hidden_size(),
                 hidden_size=config.hn_hidden_size,

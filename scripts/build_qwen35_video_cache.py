@@ -14,6 +14,8 @@ frames.
 
   python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen35vl_e4 \
       --every 4                       # shard with --shard/--num_shards as usual
+  python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen35vl_e4 \
+      --merge_shards 2
 """
 from __future__ import annotations
 
@@ -72,7 +74,17 @@ def main(argv=None):  # pragma: no cover (GPU/weights)
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--workers", type=int, default=12)
+    p.add_argument("--merge_shards", type=int, default=0,
+                   help="merge <out>.shard0..N-1 into <out> (CPU-only, no weights) and exit")
     args = p.parse_args(argv)
+
+    if args.merge_shards:                    # BEFORE any model/dataset loading
+        from scripts.build_xpair_cache import merge_shards
+        shards = [f"{args.out}.shard{i}" for i in range(args.merge_shards)]
+        n, total = merge_shards(args.out, shards)
+        print(f"merged {args.merge_shards} shards -> {n} records ({total} tokens) "
+              f"to {args.out}")
+        return
 
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 

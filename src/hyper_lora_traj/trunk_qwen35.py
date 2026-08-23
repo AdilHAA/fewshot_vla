@@ -140,7 +140,12 @@ class TrunkHyperNetwork(HyperNetwork):
         seq = torch.stack(rows)
         attn = torch.stack(masks)                    # 1=keep, 0=left-pad
 
-        out = self._trunk(inputs_embeds=seq, attention_mask=attn, use_cache=False)
+        # At train the graph MUST pass through the frozen trunk (that is how the 32
+        # layer tokens learn). At eval nothing needs gradients, but layer_queries is
+        # a leaf parameter, so an unguarded call would still build the graph and pin
+        # ~17 GB of trunk activations per episode — free memory and speed for nothing.
+        with (torch.enable_grad() if self.training else torch.no_grad()):
+            out = self._trunk(inputs_embeds=seq, attention_mask=attn, use_cache=False)
         ctx = out.last_hidden_state[:, -self.num_layers:, :]
         ctx = self.trunk_proj(ctx.to(self.trunk_proj.weight.dtype))
         return self._emit_lora(self.context_dropout(ctx), B)

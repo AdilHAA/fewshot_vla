@@ -55,7 +55,7 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         self.hypernet = HyperNetwork(
             text_embed_dim=self._vlm_text_hidden_size(),
             hidden_size=config.hn_hidden_size,
-            num_layers=len(self._vlm_text_model().layers),
+            num_layers=len(self._lora_site_layers(config)),
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
             target_modules=target_modules,
@@ -159,12 +159,21 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
         text_cfg = getattr(cfg, "text_config", cfg)
         return int(text_cfg.hidden_size)
 
+    def _lora_site_layers(self, config) -> list:
+        """Decoder layers of the LoRA injection site. "vlm_mlp" = the VLM text
+        stack (every arm so far); "expert_mlp" = the ACTION EXPERT's stack — the
+        held-out-stage site: base fully frozen, the adapter is the only
+        adaptation. Both stacks expose layer.mlp.{gate,up,down}_proj with dims
+        uniform across layers, so the shared-head HN contract is unchanged."""
+        if getattr(config, "hn_lora_target", "vlm_mlp") == "expert_mlp":
+            return list(self.model.vlm_with_expert.lm_expert.layers)
+        return list(self._vlm_text_model().layers)
+
     def _patch_mlp_layers(
         self, config: HyperLoRASmolVLAConfig
     ) -> Dict[str, Tuple[int, int]]:
-        text_model = self._vlm_text_model()
         target_modules: Dict[str, Tuple[int, int]] = {}
-        for layer_idx, layer in enumerate(text_model.layers):
+        for layer_idx, layer in enumerate(self._lora_site_layers(config)):
             mlp = layer.mlp
             for mod_name in config.hn_target_module_names:
                 base = getattr(mlp, mod_name)

@@ -26,6 +26,14 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     # fully frozen so only the hypernet learns.
     train_action_expert: bool = False
 
+    # LoRA injection site. "vlm_mlp" (default) = the VLM text-MLP linears — every
+    # experiment so far, byte-identical behaviour. "expert_mlp" = gate/up/down of
+    # the ACTION EXPERT (lm_expert) instead: the held-out-stage site where the
+    # whole base (VLM + expert) stays frozen and the generated adapter is the ONLY
+    # thing that adapts. Exclusive with train_action_expert (the expert must not
+    # be trained under its own LoRA wrappers) — validated below.
+    hn_lora_target: str = "vlm_mlp"
+
     # LoRA / hypernetwork knobs.
     lora_rank: int = 4
     lora_alpha: int = 16
@@ -75,3 +83,16 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     hn_frame_bank_path: str | None = None
     hn_p_self: float = 1.0
     hn_bank_seed: int = 42
+
+    def __post_init__(self):
+        parent = getattr(super(), "__post_init__", None)
+        if parent is not None:
+            parent()
+        if self.hn_lora_target not in ("vlm_mlp", "expert_mlp"):
+            raise ValueError(
+                f"hn_lora_target must be 'vlm_mlp' or 'expert_mlp', got {self.hn_lora_target!r}")
+        if self.hn_lora_target != "vlm_mlp" and self.train_action_expert:
+            raise ValueError(
+                "hn_lora_target=expert_mlp requires train_action_expert=false: the "
+                "expert must stay frozen so the generated adapter is the only "
+                "adaptation (and its own LoRA wrappers must not be trained under it)")

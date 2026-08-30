@@ -38,6 +38,19 @@ class DynamicLoRALinear(nn.Module):
         self.current_w_down: torch.Tensor | None = None
         self.current_w_up: torch.Tensor | None = None
 
+    @property
+    def weight(self) -> torch.Tensor:
+        """Passthrough to the frozen base weight. Callers outside our code read
+        attributes of the wrapped Linear directly — lerobot's smolvlm_with_expert
+        reads `.weight.dtype` on the expert/VLM attention projections — and a
+        wrapper without this attribute would crash them (AttributeError). The MLP
+        site never needed it (LlamaMLP.forward doesn't touch `.weight`)."""
+        return self.base_layer.weight
+
+    @property
+    def bias(self):
+        return self.base_layer.bias
+
     def set_lora_weights(self, w_down: torch.Tensor, w_up: torch.Tensor) -> None:
         self.current_w_down = w_down
         self.current_w_up = w_up

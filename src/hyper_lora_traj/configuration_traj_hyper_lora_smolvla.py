@@ -78,3 +78,13 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     hn_stream_type_emb: bool = False
     hn_per_stream_null: bool = False
     hn_readout: str = "queries"          # "queries" (==parent) | "xattn" (DEFERRED)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.hn_lora_target != "vlm_mlp" and (
+            self.hn_inject_vlm_kv or self.hn_inject_expert_q or not self.hn_inject_vlm_mlp
+        ):
+            raise ValueError(
+                "hn_lora_target=expert_mlp replaces the injection site wholesale; "
+                "the VLM-site flags (hn_inject_vlm_mlp/hn_inject_vlm_kv/"
+                "hn_inject_expert_q) must stay at their defaults with it")

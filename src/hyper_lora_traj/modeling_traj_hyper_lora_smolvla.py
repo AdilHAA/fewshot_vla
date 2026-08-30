@@ -105,7 +105,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             self.hypernet = TrunkHyperNetwork(
                 text_embed_dim=self._vlm_text_hidden_size(),
                 hidden_size=config.hn_hidden_size,
-                num_layers=len(self._vlm_text_model().layers),
+                num_layers=len(self._lora_site_layers(config)),
                 lora_rank=config.lora_rank,
                 lora_alpha=config.lora_alpha,
                 target_modules=tm,
@@ -130,7 +130,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         self.hypernet = FusionHyperNetwork(
             text_embed_dim=self._vlm_text_hidden_size(),
             hidden_size=config.hn_hidden_size,
-            num_layers=len(self._vlm_text_model().layers),
+            num_layers=len(self._lora_site_layers(config)),
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
             target_modules=tm,
@@ -162,6 +162,10 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
     def _patch_mlp_layers(
         self, config: TrajHyperLoRASmolVLAConfig
     ) -> Dict[str, Tuple[int, int]]:
+        if getattr(config, "hn_lora_target", "vlm_mlp") != "vlm_mlp":
+            # Expert-site LoRA: the parent branch handles it; the VLM-site flags
+            # below are exclusive with it (config __post_init__ enforces that).
+            return super()._patch_mlp_layers(config)
         new_sites = bool(getattr(config, "hn_inject_vlm_kv", False)) or bool(
             getattr(config, "hn_inject_expert_q", False)
         )

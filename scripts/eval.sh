@@ -8,14 +8,24 @@
 #   bash scripts/eval.sh
 #   POLICIES="lora=outputs/lora_baseline/checkpoints/last/pretrained_model" bash scripts/eval.sh
 #   TASKS="libero_spatial libero_spatial_object" SEEDS="1000" bash scripts/eval.sh
+#   TASKS="libero_90_train libero_90_eval" SEEDS="1000" bash scripts/eval.sh
 #
 # Env vars:
 #   POLICIES  (base + vision)     space-separated label=policy.path pairs
-#   TASKS     (object ID + 4 axes) space-separated suite names
+#   TASKS     (object ID + 4 axes) space-separated suite names. Two PSEUDO-suites
+#                                 exist beyond lerobot's own: libero_90_train and
+#                                 libero_90_eval = --env.task=libero_90 restricted
+#                                 to the task_ids of configs/libero90_split.json,
+#                                 run in CHUNKS of L90_CHUNK tasks (every selected
+#                                 task's MuJoCo env is created eagerly and lives
+#                                 until the run ends — 50 at once would blow RAM).
+#                                 Cells land in <label>/<pseudo>/chunk_<k>/seed_<s>.
 #   SEEDS     (1000 2000 3000)    eval seeds (≥3 for stable numbers)
 #   EPISODES  (50)                episodes per task (BATCH must divide it)
 #   BATCH     (2)                 parallel envs per task (24GB -> 2)
 #   OUT_ROOT  (outputs/eval_matrix)  root dir for all cells
+#   SPLIT_FILE (configs/libero90_split.json)  the fixed 40/50 split
+#   L90_CHUNK (10)                tasks per pseudo-suite chunk
 #   EPISODE_CACHE (1)                build the adapter once per episode and freeze it
 #                                    (the v2 protocol for every conditioned arm);
 #                                    set 0 to regenerate per inference (legacy)
@@ -35,6 +45,8 @@ SEEDS="${SEEDS:-1000 2000 3000}"
 EPISODES="${EPISODES:-50}"
 BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
+SPLIT_FILE="${SPLIT_FILE:-configs/libero90_split.json}"
+L90_CHUNK="${L90_CHUNK:-10}"
 # TASK_IDS: evaluate only these task ids WITHIN each suite (single-task check, e.g.
 # the overfit diagnostic). Format is a python list: TASK_IDS="[3]". NO quotes inside.
 # A 1-task cell would permanently shadow the full-suite cell of the same
@@ -60,6 +72,28 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     fi
 fi
 
+# One eval cell. $1 label $2 policy path $3 display suite $4 env task
+# $5 cell dir $6 task_ids python list ('' = all tasks) $7 seed
+run_cell() {
+    local label="$1" path="$2" tlabel="$3" etask="$4" cell="$5" ids="$6" seed="$7"
+    if [ -f "$cell/eval_info.json" ]; then
+        echo "==> skip [$label | $tlabel | ${cell#"$OUT_ROOT/$label/"}] — already done"
+        return 0
+    fi
+    # An existing dir without eval_info.json is a crashed cell; redo it.
+    rm -rf "$cell"
+    echo "==> eval [$label | $tlabel | ${cell#"$OUT_ROOT/$label/"}] | episodes=$EPISODES | batch=$BATCH${ids:+ | task_ids=$ids}"
+    # shellcheck disable=SC2086
+    python eval_hyper_lora.py \
+        --policy.path="$path" \
+        --env.type=libero --env.task="$etask" \
+        ${ids:+--env.task_ids=$ids} \
+        --eval.n_episodes="$EPISODES" --eval.batch_size="$BATCH" \
+        --seed="$seed" \
+        --policy.device=cuda --policy.use_amp=false \
+        --output_dir="$cell"
+}
+
 for entry in $POLICIES; do
     label="${entry%%=*}"
     path="${entry#*=}"
@@ -69,59 +103,38 @@ for entry in $POLICIES; do
         exit 1
     fi
     for task in $TASKS; do
-        for seed in $SEEDS; do
-            cell="$OUT_ROOT/$label/$task/seed_$seed"
-            if [ -f "$cell/eval_info.json" ]; then
-                echo "==> skip [$label | $task | seed=$seed] — already done"
-                continue
-            fi
-            # An existing dir without eval_info.json is a crashed cell; redo it.
-            rm -rf "$cell"
-            echo "==> eval [$label | $task | seed=$seed] | episodes=$EPISODES | batch=$BATCH${TASK_IDS:+ | task_ids=$TASK_IDS}"
-            # shellcheck disable=SC2086
-            python eval_hyper_lora.py \
-                --policy.path="$path" \
-                --env.type=libero --env.task="$task" \
-                ${TASK_IDS:+--env.task_ids=$TASK_IDS} \
-                --eval.n_episodes="$EPISODES" --eval.batch_size="$BATCH" \
-                --seed="$seed" \
-                --policy.device=cuda --policy.use_amp=false \
-                --output_dir="$cell"
-        done
+        case "$task" in
+            libero_90_train|libero_90_eval)
+                if [ -n "$TASK_IDS" ]; then
+                    echo "ERROR: TASK_IDS cannot combine with pseudo-suite $task (its" >&2
+                    echo "       task_ids come from $SPLIT_FILE). Use --env.task=libero_90." >&2
+                    exit 1
+                fi
+                if [ ! -f "$SPLIT_FILE" ]; then
+                    echo "ERROR: $task needs the split file '$SPLIT_FILE' (make_libero90_split.py)." >&2
+                    exit 1
+                fi
+                part="${task#libero_90_}"
+                ci=0
+                while IFS= read -r ids; do
+                    for seed in $SEEDS; do
+                        run_cell "$label" "$path" "$task" libero_90 \
+                            "$OUT_ROOT/$label/$task/chunk_$ci/seed_$seed" "$ids" "$seed"
+                    done
+                    ci=$((ci + 1))
+                done < <(python scripts/libero90_episodes.py --split "$SPLIT_FILE" \
+                             --part "$part" --emit chunks --chunk "$L90_CHUNK")
+                ;;
+            *)
+                for seed in $SEEDS; do
+                    run_cell "$label" "$path" "$task" "$task" \
+                        "$OUT_ROOT/$label/$task/seed_$seed" "$TASK_IDS" "$seed"
+                done
+                ;;
+        esac
     done
 done
 
 echo
 echo "==> Summary (pc_success, mean ± std over seeds)"
-python - "$OUT_ROOT" <<'PY'
-import json, statistics, sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-cells = {}  # (label, task) -> [pc_success per seed]
-for info in sorted(root.glob("*/*/seed_*/eval_info.json")):
-    label, task = info.parts[-4], info.parts[-3]
-    pc = json.load(open(info))["overall"]["pc_success"]
-    cells.setdefault((label, task), []).append(pc)
-
-if not cells:
-    print("(no completed cells found)")
-    sys.exit(0)
-
-labels = sorted({k[0] for k in cells})
-tasks = sorted({k[1] for k in cells})
-w = max(len(t) for t in tasks) + 2
-print("| policy | " + " | ".join(tasks) + " |")
-print("|---" * (len(tasks) + 1) + "|")
-for label in labels:
-    row = [label]
-    for task in tasks:
-        v = cells.get((label, task))
-        if not v:
-            row.append("—")
-        elif len(v) == 1:
-            row.append(f"{v[0]:.1f}")
-        else:
-            row.append(f"{statistics.mean(v):.1f} ± {statistics.stdev(v):.1f}")
-    print("| " + " | ".join(row) + " |")
-PY
+python scripts/summarize_matrix.py "$OUT_ROOT"

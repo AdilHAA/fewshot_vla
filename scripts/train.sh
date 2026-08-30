@@ -89,6 +89,17 @@
 #   TB         (0)                    1 = log scalars to TensorBoard instead of wandb
 #                                     (no network/login; view with
 #                                     `tensorboard --logdir $OUTPUT/tensorboard`)
+#   BASE       (HuggingFaceVLA/smolvla_libero)  base checkpoint: what the HN modes
+#                                     load frozen (--policy.base_smolvla_path) and
+#                                     what `lora` mode fine-tunes (--policy.path).
+#                                     Held-out stage: outputs/smolvla_libero_ours/...
+#   DATASET    (lerobot/libero)       training dataset repo_id
+#   DATASET_ROOT ()                   local root for DATASET (the converted
+#                                     LIBERO-90 lives on disk, not the Hub)
+#   LORA_TARGET (vlm_mlp)             LoRA injection site: vlm_mlp | expert_mlp.
+#                                     expert_mlp = adapter on the ACTION EXPERT's
+#                                     gate/up/down, base fully frozen (EXPERT=0
+#                                     enforced) — the held-out stage's site.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -128,6 +139,10 @@ DTOK="${DTOK:-all}"
 TRUNK="${TRUNK:-}"
 TSTRIDE="${TSTRIDE:-4}"
 TEXT="${TEXT:-1}"
+BASE="${BASE:-HuggingFaceVLA/smolvla_libero}"
+DATASET="${DATASET:-lerobot/libero}"
+DATASET_ROOT="${DATASET_ROOT:-}"
+LORA_TARGET="${LORA_TARGET:-vlm_mlp}"
 # --- overfit / training-extension knobs (direction 6) ---------------------------
 # EPISODES: train on ONLY these dataset episodes (single-task overfit). Format is a
 # python list, e.g. EPISODES="[57,58,59]"; empty = whole dataset (the old behaviour,
@@ -149,6 +164,11 @@ case "$TSEL"  in all|first)      ;; *) echo "ERROR: TSEL must be all|first, got 
 case "$TFILL" in ""|dup|zero)    ;; *) echo "ERROR: TFILL must be empty|dup|zero, got '$TFILL'" >&2; exit 1 ;; esac
 case "$TPOS"  in none|index|phase) ;; *) echo "ERROR: TPOS must be none|index|phase, got '$TPOS'" >&2; exit 1 ;; esac
 case "$DTOK"  in all|cls)        ;; *) echo "ERROR: DTOK must be all|cls, got '$DTOK'" >&2; exit 1 ;; esac
+case "$LORA_TARGET" in vlm_mlp|expert_mlp) ;; *) echo "ERROR: LORA_TARGET must be vlm_mlp|expert_mlp, got '$LORA_TARGET'" >&2; exit 1 ;; esac
+if [ "$LORA_TARGET" = "expert_mlp" ] && [ "$EXPERT" = "1" ]; then
+    echo "ERROR: LORA_TARGET=expert_mlp requires EXPERT=0 — the expert stays frozen" >&2
+    echo "       so the generated adapter is the only adaptation." >&2; exit 1
+fi
 if [ "$TSEL" = "first" ] && [ "$TNF" -lt 1 ]; then
     echo "ERROR: TSEL=first requires TNF>=1, got '$TNF'" >&2; exit 1
 fi
@@ -184,6 +204,9 @@ esac
 [ "$SEED" != "42" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_s${SEED}"
 [ "$AUG" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_aug"
 [ "$EXPERT" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_expert"
+[ "$LORA_TARGET" != "vlm_mlp" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${LORA_TARGET}"
+[ "$BASE" != "HuggingFaceVLA/smolvla_libero" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_b$(basename "$BASE")"
+[ "$DATASET" != "lerobot/libero" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_d$(basename "$DATASET")"
 [ "$MODE" = "traj" ] && [ "$KV" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_kv"
 # CONDITIONING knobs must appear in the name too. Without this, arms that differ
 # only by pairing / context size / token format map to the SAME default dir — the
@@ -264,7 +287,10 @@ fi
 
 # Work around lerobot/libero's wrong meta/episodes file_index (idempotent, ~21MB):
 # pre-fetch every data parquet so the loader globs + filters by episode_index.
-python -c "from src.data.libero import prefetch_all_data_parquets as p; p()"
+# Only that dataset needs (or understands) the workaround.
+if [ "$DATASET" = "lerobot/libero" ]; then
+    python -c "from src.data.libero import prefetch_all_data_parquets as p; p()"
+fi
 
 # Mode-specific policy flags.
 MODE_ARGS=()
@@ -297,10 +323,15 @@ case "$MODE" in
         # (VLM text_model MLP linears). The trainer wraps the policy with PEFT
         # when --peft.* is given; the checkpoint saves a standard adapter that
         # lerobot-eval loads automatically (config.use_peft=true).
+        if [ "$LORA_TARGET" = "expert_mlp" ]; then
+            PEFT_REGEX='model\.vlm_with_expert\.lm_expert\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)'
+        else
+            PEFT_REGEX='model\.vlm_with_expert\.vlm\.model\.text_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)'
+        fi
         MODE_ARGS+=(
-            --policy.path=HuggingFaceVLA/smolvla_libero
+            --policy.path="$BASE"
             --peft.r="$RANK"
-            --peft.target_modules='model\.vlm_with_expert\.vlm\.model\.text_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)'
+            --peft.target_modules="$PEFT_REGEX"
         ) ;;
     traj)
         # Trajectory-conditioned hypernet: the HN reads a demo clip from the
@@ -365,11 +396,19 @@ case "$MODE" in
         : ;;   # the `:` keeps the branch's exit status 0 under `set -e`
 esac
 
+# Held-out-stage knobs, appended ONLY when off-default so every historical argv
+# stays byte-identical (same rule as the conditioning flags above).
+if [ "$MODE" != "lora" ]; then
+    [ "$BASE" != "HuggingFaceVLA/smolvla_libero" ] && MODE_ARGS+=(--policy.base_smolvla_path="$BASE")
+    [ "$LORA_TARGET" != "vlm_mlp" ] && MODE_ARGS+=(--policy.hn_lora_target="$LORA_TARGET")
+fi
+
 echo "==> Train | mode=$MODE | rank=$RANK | prec=$PREC | batch=$BATCH | seed=$SEED | aug=$AUG_FLAG | expert=$EXPERT_FLAG | wandb=$WANDB_FLAG"
 echo "    output=$OUTPUT"
 python train_hyper_lora.py \
     "${MODE_ARGS[@]}" \
-    --dataset.repo_id=lerobot/libero \
+    --dataset.repo_id="$DATASET" \
+    ${DATASET_ROOT:+--dataset.root=$DATASET_ROOT} \
     --dataset.use_imagenet_stats=false \
     --dataset.image_transforms.enable="$AUG_FLAG" \
     ${EPISODES:+--dataset.episodes=$EPISODES} \

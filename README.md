@@ -70,6 +70,11 @@ scripts/
                              объектов / сдвигом камеры (движение то же, вид другой)
   build_xpair_cache.py       оффлайн-кеш эмбеддингов демонстраций (encode-once)
   build_frame_bank.py        банк t=0 кадров всех эпизодов
+  make_libero90_split.py     фикс. сплит LIBERO-90: 40 train / 50 eval (configs/libero90_*.json)
+  prepare_base_smolvla_libero.py  копия smolvla_base с LIBERO-фичами (база ours)
+  libero90_episodes.py       эпизоды train-40 (--dataset.episodes) / чанки task_ids для эвала
+  rename_libero90_features.py  wrist_image → image2 в конвертированном LIBERO-90 v3.0
+  summarize_matrix.py        сводка eval-матрицы (понимает чанки libero_90_*, per-task)
   patch_lerobot.py           пост-инсталл фикс lerobot под transformers 5 / py3.12
   analyze_lora.py            зонд: зависят ли сгенерированные LoRA от задачи
 ```
@@ -128,6 +133,53 @@ EPISODE_CACHE=1 POLICIES="my_run=outputs/my_run/checkpoints/last/pretrained_mode
 ```bash
 pip uninstall -y torchaudio
 ```
+
+## Этап LIBERO-90 held-out
+
+Протокол: `docs/experiments/2026-08-30-plan-libero90-heldout.md` в основном репо
+(HyperNetwork-LoRA-for-VLA-Adaptation). База `smolvla_libero_ours` файнтьюнится из
+`lerobot/smolvla_base` на 40 задачах LIBERO-90 (сплит в `configs/libero90_split.json`),
+остальные 50 + libero_10/goal/object/spatial — held-out; гиперсеть при полностью
+замороженной базе предсказывает LoRA только на action expert (`LORA_TARGET=expert_mlp`).
+
+```bash
+# 1) данные: LIBERO-90 (yzembodied = оригинальные 4500 демо, episode//50 == task_id) -> v3.0
+hf download yzembodied/libero_90_image --repo-type dataset --local-dir outputs/libero90/libero_90_image
+python -m lerobot.scripts.convert_dataset_v21_to_v30 --repo-id yzembodied/libero_90_image \
+    --root "$PWD/outputs/libero90/libero_90_image" --push-to-hub false
+python scripts/rename_libero90_features.py --root outputs/libero90/libero_90_image
+python scripts/make_libero90_split.py --verify_against_libero   # сверка снапшота реестра
+
+# 2) файнтьюн ours: рецепт статьи (100k x batch 64, lr 1e-4 cosine -> 2.5e-6, bf16)
+python scripts/prepare_base_smolvla_libero.py --out outputs/base/smolvla_base_libero_io
+EPIS="$(python scripts/libero90_episodes.py --part train)"      # 40 задач x 50 = 2000 эпизодов
+ARGS=(
+    --policy.path=outputs/base/smolvla_base_libero_io
+    --policy.push_to_hub=false --policy.device=cuda
+    --policy.scheduler_decay_steps=100000
+    --dataset.repo_id=yzembodied/libero_90_image
+    --dataset.root="$PWD/outputs/libero90/libero_90_image"
+    --dataset.use_imagenet_stats=false
+    --dataset.episodes="$EPIS"
+    --batch_size=64 --num_workers=12
+    --save_freq=10000 --save_checkpoint=true --seed=42
+    --wandb.enable=true
+)
+TENSORBOARD=1 accelerate launch --num_processes=1 --mixed_precision=bf16 \
+    train_hyper_lora.py "${ARGS[@]}" --steps=200 --output_dir=outputs/smoke_ours      # смоук
+TENSORBOARD=1 accelerate launch --num_processes=1 --mixed_precision=bf16 \
+    train_hyper_lora.py "${ARGS[@]}" --steps=100000 --output_dir=outputs/smolvla_libero_ours
+
+# 3) eval (libero_90_train/eval — псевдосьюты eval.sh, чанками по 10 задач)
+POLICIES="ours=outputs/smolvla_libero_ours/checkpoints/last/pretrained_model" \
+TASKS="libero_90_train libero_90_eval libero_10 libero_goal libero_object libero_spatial" \
+SEEDS="1000" bash scripts/eval.sh
+python scripts/summarize_matrix.py outputs/eval_matrix --per_task libero_90_eval
+```
+
+Гиперсеть на новой базе (после файнтьюна): `BASE=<ckpt ours> DATASET=yzembodied/libero_90_image
+DATASET_ROOT=outputs/libero90/libero_90_image LORA_TARGET=expert_mlp MODE=traj ...
+bash scripts/train.sh` — дефолтные argv старых армов не меняются.
 
 ## FYI
 Пока забейте и не смотрите на код связанный с ретривалом/кондишенингом траекторий целых, там буду переделывать

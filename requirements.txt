@@ -36,3 +36,8 @@ future
 # libero/__init__.py → empty wheel). scripts/setup.sh clones it into
 # third_party/LIBERO and registers it via a .pth. The deps above are LIBERO's
 # runtime requirements.
+
+# NOT installed by default — needed ONLY for the TRUNK arms (Qwen3.5 backbone):
+#   uv pip install flash-linear-attention   # GatedDeltaNet kernels; needs Triton>=3.7.1
+# (without it the trunk falls back to a chunked fp32 path / crashes with
+#  "chunk_gated_delta_rule is None"; causal-conv1d is NOT required)

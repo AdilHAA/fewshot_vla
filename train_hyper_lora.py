@@ -102,9 +102,37 @@ def _patch_deterministic_episode_filters() -> None:
     _dr.load_nested_dataset = load_nested_dataset
 
 
+def _patch_ddp_timeout() -> None:
+    """Raise the process-group timeout for DDP runs (env DDP_TIMEOUT_S, default
+    3600s; torch's NCCL default is 600s). lerobot's launch order is: rank 0
+    builds the dataset (a cold arrow-cache build over NFS runs ~20 min), the
+    other ranks wait at a barrier — with the 10-minute default they die with
+    c10d 'wait timeout after 600000ms' before rank 0 arrives. lerobot creates
+    the Accelerator itself with no timeout knob, so the kwargs handler is
+    injected here. Append-only: an InitProcessGroupKwargs already passed by the
+    caller wins."""
+    import datetime
+
+    import accelerate
+    from accelerate.utils import InitProcessGroupKwargs
+
+    seconds = int(os.environ.get("DDP_TIMEOUT_S", "3600"))
+    orig = accelerate.Accelerator.__init__
+
+    def patched(self, *args, **kwargs):
+        handlers = list(kwargs.get("kwargs_handlers") or [])
+        if not any(isinstance(h, InitProcessGroupKwargs) for h in handlers):
+            handlers.append(InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=seconds)))
+        kwargs["kwargs_handlers"] = handlers
+        orig(self, *args, **kwargs)
+
+    accelerate.Accelerator.__init__ = patched
+
+
 if __name__ == "__main__":
     _inject_base_config_overrides()
     _patch_deterministic_episode_filters()
+    _patch_ddp_timeout()
     if os.environ.get("TENSORBOARD") == "1":
         # The train loop instantiates whatever `WandBLogger` names in its module
         # namespace; rebinding it routes all metric logging to TensorBoard without

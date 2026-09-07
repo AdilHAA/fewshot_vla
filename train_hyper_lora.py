@@ -74,8 +74,37 @@ def _inject_base_config_overrides() -> None:
         sys.argv += extra
 
 
+def _patch_deterministic_episode_filters() -> None:
+    """lerobot 0.5.1 feeds `--dataset.episodes` into Dataset.from_parquet as a
+    pyarrow Expression. On some pyarrow/datasets combos the Expression does not
+    pickle deterministically, so the `datasets` cache fingerprint changes on
+    EVERY launch and the multi-GB arrow cache is rebuilt from scratch each time.
+    Under accelerate DDP that is fatal, not just slow: ranks 1..N wait for rank 0
+    at a 10-minute barrier while it rebuilds, then die with c10d
+    'wait timeout after 600000ms' (observed on the LIBERO-90 finetune).
+    The SAME filter as a plain DNF list of tuples hashes deterministically and
+    pyarrow accepts it unchanged — verified: identical rows, one cache dir,
+    second process reuses it without a rebuild."""
+    import datasets as hf_datasets
+    import lerobot.datasets.dataset_reader as _dr
+
+    def load_nested_dataset(pq_dir, features=None, episodes=None):
+        paths = sorted(pq_dir.glob("*/*.parquet"))
+        if len(paths) == 0:
+            raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
+        filters = ([("episode_index", "in", sorted(int(e) for e in episodes))]
+                   if episodes is not None else None)
+        return hf_datasets.Dataset.from_parquet([str(p) for p in paths],
+                                                filters=filters, features=features)
+
+    # dataset_reader binds the name at import (`from ...io_utils import ...`),
+    # so the override must land on the READER module, not on io_utils.
+    _dr.load_nested_dataset = load_nested_dataset
+
+
 if __name__ == "__main__":
     _inject_base_config_overrides()
+    _patch_deterministic_episode_filters()
     if os.environ.get("TENSORBOARD") == "1":
         # The train loop instantiates whatever `WandBLogger` names in its module
         # namespace; rebinding it routes all metric logging to TensorBoard without

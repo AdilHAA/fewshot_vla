@@ -94,8 +94,20 @@ def _patch_deterministic_episode_filters() -> None:
             raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
         filters = ([("episode_index", "in", sorted(int(e) for e in episodes))]
                    if episodes is not None else None)
-        return hf_datasets.Dataset.from_parquet([str(p) for p in paths],
-                                                filters=filters, features=features)
+        # Serialize dataset loads across the LOCAL node with a /tmp flock. With the
+        # datasets cache on NFS, several DDP ranks entering the cache at once
+        # deadlocked in its file locks (ranks frozen: 0 CPU, 0 IO, 0 majflt) while
+        # rank 0 — which always loads ALONE before the barrier — never hung. /tmp
+        # is node-local, so this flock always works; ranks simply take turns.
+        import fcntl
+
+        with open(f"/tmp/lerobot_dsload_{os.getuid()}.lock", "w") as lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            try:
+                return hf_datasets.Dataset.from_parquet([str(p) for p in paths],
+                                                        filters=filters, features=features)
+            finally:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
     # dataset_reader binds the name at import (`from ...io_utils import ...`),
     # so the override must land on the READER module, not on io_utils.

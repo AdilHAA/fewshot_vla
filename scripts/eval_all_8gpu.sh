@@ -14,7 +14,12 @@
 #
 # Env vars: SEEDS (1000) EPISODES (50) BATCH (10) OUT_ROOT (outputs/eval_matrix)
 #           GPUS ("0 1 2 3 4 5 6 7")  LOG_DIR (outputs/eval_logs)
-# Edit the ASSIGN table below to rebalance or add suites (e.g. libero_90_train).
+#           ASSIGN  override the per-card table: rows "<TASKS>|<L90_CHUNKS>" joined
+#                   by ';' — one row per GPU in GPUS. Example, the in-distribution
+#                   check (40 train tasks = 4 chunks of 10) on four cards:
+#             GPUS="0 1 2 3" ASSIGN="libero_90_train|0;libero_90_train|1;libero_90_train|2;libero_90_train|3" \
+#                 bash scripts/eval_all_8gpu.sh ours=<ckpt>
+#           PER_TASK (libero_90_eval)  suite whose per-task table the summary prints
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -27,17 +32,24 @@ OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
 LOG_DIR="${LOG_DIR:-outputs/eval_logs}"
 read -r -a GPUS <<< "${GPUS:-0 1 2 3 4 5 6 7}"
 
-# One line per card: "<TASKS>|<L90_CHUNKS>"  (L90_CHUNKS applies to libero_90_eval only)
-ASSIGN=(
-    "libero_90_eval libero_10|0"
-    "libero_90_eval libero_goal|1"
-    "libero_90_eval libero_object|2"
-    "libero_90_eval libero_spatial|3"
-    "libero_90_eval libero_10_lan|4"
-    "libero_10_object|"
-    "libero_10_swap|"
-    "libero_10_task|"
-)
+# One row per card: "<TASKS>|<L90_CHUNKS>"  (L90_CHUNKS applies to the libero_90_*
+# pseudo-suites only). Default = the held-out matrix over 8 cards; env ASSIGN
+# (rows joined by ';') replaces the table.
+if [ -n "${ASSIGN:-}" ]; then
+    IFS=';' read -r -a ASSIGN <<< "$ASSIGN"
+else
+    ASSIGN=(
+        "libero_90_eval libero_10|0"
+        "libero_90_eval libero_goal|1"
+        "libero_90_eval libero_object|2"
+        "libero_90_eval libero_spatial|3"
+        "libero_90_eval libero_10_lan|4"
+        "libero_10_object|"
+        "libero_10_swap|"
+        "libero_10_task|"
+    )
+fi
+PER_TASK="${PER_TASK:-libero_90_eval}"
 if [ "${#GPUS[@]}" -ne "${#ASSIGN[@]}" ]; then
     echo "ERROR: ${#GPUS[@]} GPUs given but ASSIGN has ${#ASSIGN[@]} rows" >&2; exit 1
 fi
@@ -70,5 +82,5 @@ done
 
 echo
 echo "==> Summary"
-python scripts/summarize_matrix.py "$OUT_ROOT" --per_task libero_90_eval
+python scripts/summarize_matrix.py "$OUT_ROOT" --per_task "$PER_TASK"
 [ "$fail" = 0 ] || { echo "Some workers failed; re-run the same command — finished cells are skipped." >&2; exit 1; }

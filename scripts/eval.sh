@@ -26,6 +26,10 @@
 #   OUT_ROOT  (outputs/eval_matrix)  root dir for all cells
 #   SPLIT_FILE (configs/libero90_split.json)  the fixed 40/50 split
 #   L90_CHUNK (10)                tasks per pseudo-suite chunk
+#   L90_CHUNKS ()                 run only these chunk indices of a pseudo-suite
+#                                 (space-separated, e.g. "0 2"); empty = all. Lets
+#                                 a multi-GPU launcher spread the 5 libero_90_eval
+#                                 chunks over cards — cells keep the chunk_<k> layout.
 #   EPISODE_CACHE (1)                build the adapter once per episode and freeze it
 #                                    (the v2 protocol for every conditioned arm);
 #                                    set 0 to regenerate per inference (legacy)
@@ -47,6 +51,7 @@ BATCH="${BATCH:-2}"
 OUT_ROOT="${OUT_ROOT:-outputs/eval_matrix}"
 SPLIT_FILE="${SPLIT_FILE:-configs/libero90_split.json}"
 L90_CHUNK="${L90_CHUNK:-10}"
+L90_CHUNKS="${L90_CHUNKS:-}"
 # TASK_IDS: evaluate only these task ids WITHIN each suite (single-task check, e.g.
 # the overfit diagnostic). Format is a python list: TASK_IDS="[3]". NO quotes inside.
 # A 1-task cell would permanently shadow the full-suite cell of the same
@@ -117,10 +122,12 @@ for entry in $POLICIES; do
                 part="${task#libero_90_}"
                 ci=0
                 while IFS= read -r ids; do
-                    for seed in $SEEDS; do
-                        run_cell "$label" "$path" "$task" libero_90 \
-                            "$OUT_ROOT/$label/$task/chunk_$ci/seed_$seed" "$ids" "$seed"
-                    done
+                    if [ -z "$L90_CHUNKS" ] || grep -qw "$ci" <<< "$L90_CHUNKS"; then
+                        for seed in $SEEDS; do
+                            run_cell "$label" "$path" "$task" libero_90 \
+                                "$OUT_ROOT/$label/$task/chunk_$ci/seed_$seed" "$ids" "$seed"
+                        done
+                    fi
                     ci=$((ci + 1))
                 done < <(python scripts/libero90_episodes.py --split "$SPLIT_FILE" \
                              --part "$part" --emit chunks --chunk "$L90_CHUNK")

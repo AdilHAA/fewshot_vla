@@ -68,11 +68,16 @@ if [ -n "$TASK_IDS" ] && [ "$OUT_ROOT" = "outputs/eval_matrix" ]; then
 fi
 [ "${EPISODE_CACHE:-1}" != "0" ] && export HN_LORA_CACHE="${HN_LORA_CACHE:-episode}"
 
-# Guard: refuse to start if the GPU is already busy (avoids two-process OOM).
+# Guard: warn if the GPU this worker will use is already busy (two-process OOM).
+# Query ONLY that card and read the whole output: `| head -1` on a multi-GPU
+# node closed the pipe early, nvidia-smi died of SIGPIPE, and with pipefail+set -e
+# the script exited silently before printing anything (all 8 workers "failed"
+# with empty logs on the 8xA100 node).
 if command -v nvidia-smi >/dev/null 2>&1; then
-    used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)"
-    if [ "${used:-0}" -gt 1000 ]; then
-        echo "WARNING: GPU already has ${used} MiB in use — free it or Ctrl-C." >&2
+    gpu_id="${CUDA_VISIBLE_DEVICES%%,*}"; gpu_id="${gpu_id:-0}"
+    used="$(nvidia-smi --id="$gpu_id" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sed -n 1p || true)"
+    if [ "${used:-0}" -gt 1000 ] 2>/dev/null; then
+        echo "WARNING: GPU $gpu_id already has ${used} MiB in use — free it or Ctrl-C." >&2
         sleep 5
     fi
 fi

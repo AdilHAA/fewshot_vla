@@ -161,7 +161,19 @@ def _patch_datasets_soft_filelock() -> None:
     print("[train] DATASETS_SOFT_LOCK: datasets cache locks -> SoftFileLock")
 
 
+def _enable_stack_dump_on_usr1() -> None:
+    """`kill -USR1 <pid>` makes the process print every thread's Python stack to
+    stderr (faulthandler; no ptrace needed — py-spy is forbidden on the cluster).
+    The DDP hangs on the 8xA100 node could not be located otherwise: ranks sat in
+    R/D states with no I/O and no page faults for an hour."""
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
+
 if __name__ == "__main__":
+    _enable_stack_dump_on_usr1()
     _inject_base_config_overrides()
     _patch_deterministic_episode_filters()
     _patch_ddp_timeout()

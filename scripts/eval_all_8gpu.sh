@@ -36,7 +36,9 @@ read -r -a GPUS <<< "${GPUS:-0 1 2 3 4 5 6 7}"
 # pseudo-suites only). Default = the held-out matrix over 8 cards; env ASSIGN
 # (rows joined by ';') replaces the table.
 if [ -n "${ASSIGN:-}" ]; then
-    IFS=';' read -r -a ASSIGN <<< "$ASSIGN"
+    # rows separated by ';' OR newlines (a pasted multi-line value must not lose rows);
+    # blank rows and surrounding whitespace are dropped.
+    mapfile -t ASSIGN < <(tr ';' '\n' <<< "$ASSIGN" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
 else
     ASSIGN=(
         "libero_90_eval libero_10|0"

@@ -148,6 +148,12 @@ hf download yzembodied/libero_90_image --repo-type dataset --local-dir outputs/l
 python -m lerobot.scripts.convert_dataset_v21_to_v30 --repo-id yzembodied/libero_90_image \
     --root "$PWD/outputs/libero90/libero_90_image" --push-to-hub false
 python scripts/rename_libero90_features.py --root outputs/libero90/libero_90_image
+# yzembodied хранит agentview ЗЕРКАЛЬНО (по горизонтали) относительно рендера env lerobot —
+# политика на таких кадрах даёт 25-40% на своих же задачах против 92% при совпадающей
+# конвенции. Чиним датасет один раз (wrist добавить в --keys, если проба B это покажет):
+python scripts/flip_libero90_images.py --root outputs/libero90/libero_90_image \
+    --out outputs/libero90/libero_90_image_flipped --keys observation.images.image
+# дальше везде --dataset.root=.../libero_90_image_flipped
 python scripts/make_libero90_split.py --verify_against_libero   # сверка снапшота реестра
 
 # 2) файнтьюн ours: рецепт статьи (100k x batch 64, lr 1e-4 cosine -> 2.5e-6, bf16)

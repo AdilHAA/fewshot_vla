@@ -172,10 +172,39 @@ def _enable_stack_dump_on_usr1() -> None:
     faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
 
 
+def _patch_fast_index_mapping() -> None:
+    """lerobot 0.5.1 builds the episode-filtered index map as
+    `enumerate(self.hf_dataset["index"])`. With datasets>=3 that is a lazy Column
+    iterated ROW BY ROW through the dataset's set_transform (hf_transform_to_torch),
+    i.e. every PNG of every frame is decoded and to_tensor'ed just to read one
+    int: ~20 min of CPU per process on LIBERO-90 ('Creating dataset' on a WARM
+    cache), and under DDP the three non-main ranks spend it while rank 0 spins at
+    the next barrier — the 'hang' at 'Loading weights from local directory'
+    (found via the SIGUSR1 stack dumps). Read the column from arrow instead:
+    identical mapping (verified), milliseconds. Falls back to the original when
+    the dataset carries an indices mapping (select/shuffle), which from_parquet
+    never produces here."""
+    import lerobot.datasets.dataset_reader as _dr
+
+    orig = _dr.DatasetReader._build_index_mapping
+
+    def fast(self):
+        self._absolute_to_relative_idx = None
+        if self.episodes is None or self.hf_dataset is None:
+            return
+        if getattr(self.hf_dataset, "_indices", None) is not None:
+            return orig(self)
+        col = self.hf_dataset.data.column("index").to_pylist()
+        self._absolute_to_relative_idx = {int(a): r for r, a in enumerate(col)}
+
+    _dr.DatasetReader._build_index_mapping = fast
+
+
 if __name__ == "__main__":
     _enable_stack_dump_on_usr1()
     _inject_base_config_overrides()
     _patch_deterministic_episode_filters()
+    _patch_fast_index_mapping()
     _patch_ddp_timeout()
     _patch_datasets_soft_filelock()
     if os.environ.get("TENSORBOARD") == "1":

@@ -19,7 +19,12 @@ DATA_REPO="${DATA_REPO:-yzembodied/libero_90_image}"
 WORKERS="${WORKERS:-12}"
 case "$DATA_ROOT" in /*) ;; *) DATA_ROOT="$PWD/$DATA_ROOT" ;; esac
 
-EPIS="$(python scripts/libero90_episodes.py --part train 2>/dev/null)"
+PY=python; command -v python >/dev/null 2>&1 || PY=python3
+EPIS="$("$PY" scripts/libero90_episodes.py --part train 2>/dev/null)"
+if [ -z "$EPIS" ]; then
+    echo "ERROR: could not build the train episode list (run from the repo root with the venv active)" >&2
+    return 1 2>/dev/null || exit 1
+fi
 ARGS=(
     --policy.path="$BASE_PATH"
     --policy.push_to_hub=false
@@ -33,4 +38,4 @@ ARGS=(
     --save_freq=10000 --save_checkpoint=true --seed=42
     --wandb.enable=true
 )
-echo "ARGS ready: base=$BASE_PATH data=$DATA_ROOT episodes=$(python -c "print(len($EPIS))") workers=$WORKERS"
+echo "ARGS ready: base=$BASE_PATH data=$DATA_ROOT episodes=$("$PY" -c "print(len($EPIS))") workers=$WORKERS"

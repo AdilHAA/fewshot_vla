@@ -150,9 +150,10 @@ python -m lerobot.scripts.convert_dataset_v21_to_v30 --repo-id yzembodied/libero
 python scripts/rename_libero90_features.py --root outputs/libero90/libero_90_image
 # yzembodied хранит agentview ЗЕРКАЛЬНО (по горизонтали) относительно рендера env lerobot —
 # политика на таких кадрах даёт 25-40% на своих же задачах против 92% при совпадающей
-# конвенции. Чиним датасет один раз (wrist добавить в --keys, если проба B это покажет):
+# конвенции; зеркальны ОБЕ камеры (проба: флип agentview 92.5%, обеих 97.5%). Чиним датасет один раз:
 python scripts/flip_libero90_images.py --root outputs/libero90/libero_90_image \
-    --out outputs/libero90/libero_90_image_flipped --keys observation.images.image
+    --out outputs/libero90/libero_90_image_flipped \
+    --keys observation.images.image observation.images.image2
 # дальше везде --dataset.root=.../libero_90_image_flipped
 python scripts/make_libero90_split.py --verify_against_libero   # сверка снапшота реестра
 

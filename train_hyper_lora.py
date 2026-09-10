@@ -141,10 +141,31 @@ def _patch_ddp_timeout() -> None:
     accelerate.Accelerator.__init__ = patched
 
 
+def _patch_datasets_soft_filelock() -> None:
+    """DATASETS_SOFT_LOCK=1: make `datasets` take its cache lock with SoftFileLock
+    (lock = atomic creation of a file) instead of fcntl. On this node the cache
+    lives on an NFS4 mount with local_lock=none, i.e. fcntl locks go to the NFS
+    server — the first process (rank 0) acquired it fine, every later rank blocked
+    in the kernel forever (0 CPU, 0 I/O, 0 page faults) and the DDP run hung at
+    rank 0's first collective. SoftFileLock needs no server-side lock state.
+    Caveat: a process killed while holding it leaves <cache>/**/*.lock behind —
+    delete it if a later run stalls at 'Creating dataset'."""
+    if os.environ.get("DATASETS_SOFT_LOCK") != "1":
+        return
+    import filelock
+    import datasets.builder as _b
+    import datasets.utils._filelock as _fl
+
+    _b.FileLock = filelock.SoftFileLock          # download_and_prepare()'s lock
+    _fl.FileLock = filelock.SoftFileLock
+    print("[train] DATASETS_SOFT_LOCK: datasets cache locks -> SoftFileLock")
+
+
 if __name__ == "__main__":
     _inject_base_config_overrides()
     _patch_deterministic_episode_filters()
     _patch_ddp_timeout()
+    _patch_datasets_soft_filelock()
     if os.environ.get("TENSORBOARD") == "1":
         # The train loop instantiates whatever `WandBLogger` names in its module
         # namespace; rebinding it routes all metric logging to TensorBoard without

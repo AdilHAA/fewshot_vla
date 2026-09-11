@@ -136,6 +136,8 @@ pip uninstall -y torchaudio
 
 ## Этап LIBERO-90 held-out
 
+**Чекпоинт `smolvla_libero_ours` + датасет LIBERO-90 для команды:** `MODEL_CARD.md` (где лежит, конвенции, как гонять/дообучать).
+
 Протокол: `docs/experiments/2026-08-30-plan-libero90-heldout.md` в основном репо
 (HyperNetwork-LoRA-for-VLA-Adaptation). База `smolvla_libero_ours` файнтьюнится из
 `lerobot/smolvla_base` на 40 задачах LIBERO-90 (сплит в `configs/libero90_split.json`),

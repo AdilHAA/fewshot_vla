@@ -151,7 +151,7 @@ def _nvidia_frame0(root, ep, cam="observation.images.image"):
     import av
 
     for pf in root.glob("meta/episodes/**/*.parquet"):
-        t = pq.read_table(pf).filter(pq.read_table(pf)["episode_index"] == ep)
+        t = pq.read_table(pf, filters=[("episode_index", "==", ep)])
         if t.num_rows:
             row = t.slice(0, 1).to_pylist()[0]
             break

@@ -43,3 +43,6 @@ checkpoints/
 .idea/
 .vscode/
 *.swp
+
+# tests stay in the research repo, not in the executable mirror
+/tests/

@@ -157,6 +157,12 @@ python scripts/flip_libero90_images.py --root outputs/libero90/libero_90_image \
     --out outputs/libero90/libero_90_image_flipped \
     --keys observation.images.image observation.images.image2
 # дальше везде --dataset.root=.../libero_90_image_flipped
+# no-op-фильтрованный вариант тех же демо (nvidia/LIBERO_LeRobot_v3/libero_90, OpenVLA-фильтр:
+# 3921 эп., задача 51 отсутствует). Скрипт: скачать -> wrist_image->image2 -> гриппер 0/1 -> ±1 ->
+# task_id по совпадению действий с yzembodied -> train_episodes.json -> проверка ориентации кадров
+python scripts/prepare_nvidia_libero90.py --out outputs/libero90/nvidia --reference outputs/libero90/libero_90_image_flipped
+# обучение на нём: EPISODES_FILE=outputs/libero90/nvidia/libero_90/train_episodes.json DATA_ROOT=outputs/libero90/nvidia/libero_90 \
+#   DATA_REPO=nvidia/LIBERO_LeRobot_v3 VIDEO_BACKEND=pyav NPROC=8 OUT=outputs/smolvla_libero_nvidia bash scripts/finetune_ours.sh
 python scripts/make_libero90_split.py --verify_against_libero   # сверка снапшота реестра
 
 # 2) файнтьюн ours: рецепт статьи (100k x batch 64, lr 1e-4 cosine -> 2.5e-6, bf16)

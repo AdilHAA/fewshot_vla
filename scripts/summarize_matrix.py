@@ -43,7 +43,10 @@ def load_cells(root: Path):
             if tid in tasks:
                 print(f"WARNING: duplicate task {tid} in {label}/{suite}/{seed}",
                       file=sys.stderr)
-            tasks[tid] = float(row["metrics"]["pc_success"])
+            m = row["metrics"]
+            # lerobot writes per-task episode lists, not a pc_success scalar
+            pc = m["pc_success"] if "pc_success" in m else 100.0 * statistics.mean(m["successes"])
+            tasks[tid] = float(pc)
         if not chunked:
             overall[key] = float(info["overall"]["pc_success"])
     return per_task, overall

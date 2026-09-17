@@ -45,47 +45,56 @@ OpenVLA — 3921 эпизод, 569 249 кадров (задача 51 `pick up th
 кадров против эталона входа политики; затем `scripts/harmonize_libero90.py` — приведение к конвенциям
 lerobot/libero (метка fps 20→10 с ремуксом видео без перекодирования, лишние `observation.states.*` убраны).
 
-## Использовать как обычный lerobot-датасет
+## Как с ним работать (сценарии)
 
+Один раз:
 ```bash
 hf download Kesvill/libero_90_lerobot_v3 --repo-type dataset --local-dir outputs/libero90/libero_90_lerobot_v3
 ```
 
-Train (любой lerobot-политикой; наш рецепт — ниже) на train-части:
-
-```bash
---dataset.repo_id=Kesvill/libero_90_lerobot_v3 --dataset.root=outputs/libero90/libero_90_lerobot_v3 \
---dataset.episodes="$(cat outputs/libero90/libero_90_lerobot_v3/train_episodes.json)" --dataset.video_backend=pyav
-```
-
-Eval — стоковый lerobot-eval с `--env.task=libero_90 --env.task_ids=[...]` (id из
-`configs/libero90_split.json`). В `scripts/eval.sh` это два псевдосьюта `libero_90_train` и
-`libero_90_eval`, которые гоняются чанками по 10 задач рядом с дефолтными:
-
+**1. Эвал любой политики на LIBERO-90 + дефолтных сьютах.** `libero_90_train` / `libero_90_eval` —
+псевдосьюты `scripts/eval.sh` (стоковый lerobot-eval `--env.task=libero_90` с `task_ids` из
+`configs/libero90_split.json`, чанками по 10 задач — env всех выбранных задач живут одновременно):
 ```bash
 POLICIES="my=<путь или HF id>" TASKS="libero_90_train libero_90_eval libero_10 libero_goal libero_object libero_spatial" \
 SEEDS=1000 BATCH=10 OUT_ROOT=outputs/my_eval bash scripts/eval.sh
 python scripts/summarize_matrix.py outputs/my_eval --per_task libero_90_eval
 ```
+`BATCH` — параллельных env на задачу (80 ГБ → 10, 24 ГБ → 2). Матрица резюмируемая. На несколько
+карт — `scripts/eval_all_8gpu.sh` (в шапке пример раскладки `ASSIGN`).
 
-Все 8 карт сразу — `scripts/eval_all_8gpu.sh` (раскладка по картам в `ASSIGN`).
-
-Совместный трейн с дефолтным LIBERO — один смерженный датасет (проверка совместимости и merge одной
-командой: `python scripts/check_libero_merge.py --merge`, результат в `outputs/libero90/libero_all`; то же руками:)
-
+**2. Файнтьюн SmolVLA на train-части по нашему рецепту** (так получена `smolvla_libero_90`):
 ```bash
-hf download lerobot/libero --repo-type dataset --revision v3.0 --local-dir outputs/libero90/lerobot_libero
-python -m lerobot.scripts.lerobot_edit_dataset --repo_id lerobot/libero --root outputs/libero90/lerobot_libero \
-    --new_repo_id local/libero_all --new_root outputs/libero90/libero_all \
-    --operation.type merge --operation.repo_ids '["lerobot/libero","Kesvill/libero_90_lerobot_v3"]' \
-    --operation.roots '["outputs/libero90/lerobot_libero","outputs/libero90/libero_90_lerobot_v3"]'
+python scripts/prepare_base_smolvla_libero.py --out outputs/base/smolvla_base_libero_io
+NPROC=8 STEPS=100000 OUT=outputs/my_run bash scripts/finetune_ours.sh     # NPROC карт, глобальный batch 64
 ```
+Ручки через env: `BASE_PATH` (старт с другой базы, в т.ч. `Kesvill/smolvla_libero_90`), `DATA_ROOT`,
+`EPISODES_FILE` (по умолчанию `train_episodes.json` датасета), `BATCH`, `GPUS`, `WORKERS`; смоук —
+`STEPS=300 OUT=outputs/probe`. Лог — `<OUT>.log`, TensorBoard — `<OUT>/tensorboard`.
 
-В смерженном датасете эпизоды перенумерованы (наши идут после 1693 эпизодов lerobot/libero), а `task_index`
-строится по тексту инструкции — для выбора эпизодов используйте `episode_task_map.json` со смещением, не текст. Первое открытие
-датасета строит arrow-кеш (минуты; у video-датасета он маленький); обучение запускайте через
-`train_hyper_lora.py` — обёртку над lerobot-train, в которой починены нестабильный fingerprint
-кеша и построчный декод картинок при инициализации (иначе старт 20 мин на процесс и вис DDP).
+**3. Стоковый lerobot-train любой политикой на train-части:**
+```bash
+EPIS="$(python -c 'import json;print(json.dumps(json.load(open("outputs/libero90/libero_90_lerobot_v3/train_episodes.json")),separators=(",",":")))')"
+python train_hyper_lora.py --policy.type=<...> --dataset.repo_id=Kesvill/libero_90_lerobot_v3 \
+    --dataset.root=outputs/libero90/libero_90_lerobot_v3 --dataset.episodes="$EPIS" --dataset.video_backend=pyav ...
+```
+`train_hyper_lora.py` — обёртка над `lerobot-train` с теми же флагами; в ней починены нестабильный
+fingerprint кеша datasets и построчный декод картинок при инициализации (голый lerobot-train на этом
+датасете стартует 20 мин на процесс и виснет в DDP). `video_backend=pyav` — AV1 не всякий torchcodec
+декодирует. Без `--dataset.episodes` в обучение попадут и 50 held-out задач.
+
+**4. Совместный трейн с дефолтным LIBERO** — один смерженный датасет (в lerobot 0.5.1 список
+`repo_id` в трейнере не поддерживается):
+```bash
+python scripts/check_libero_merge.py --merge     # validate_all_metadata + merge -> outputs/libero90/libero_all
+```
+В смерженном датасете наши эпизоды идут после 1693 эпизодов lerobot/libero (train-список сдвигается
+на 1693), а `task_index` строится по тексту инструкции — эпизоды выбирайте по `episode_task_map.json`,
+не по тексту.
+
+**5. Гиперсеть на LIBERO-90** — пока не поддержана: резолв задачи по тексту и кеши демо в
+`src/traj_data` рассчитаны на lerobot/libero (74 уникальных текста на 90 задач ломают ключевание);
+это следующий шаг этапа.
 
 ## Модель `smolvla_libero_90`
 

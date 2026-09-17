@@ -96,6 +96,8 @@
 #   DATASET    (lerobot/libero)       training dataset repo_id
 #   DATASET_ROOT ()                   local root for DATASET (the converted
 #                                     LIBERO-90 lives on disk, not the Hub)
+#   VIDEO_BACKEND ()                  --dataset.video_backend (pyav for AV1 video
+#                                     datasets such as Kesvill/libero_90_lerobot_v3)
 #   LORA_TARGET (vlm_mlp)             LoRA injection site: vlm_mlp | expert_mlp.
 #                                     expert_mlp = adapter on the ACTION EXPERT's
 #                                     gate/up/down, base fully frozen (EXPERT=0
@@ -142,6 +144,7 @@ TEXT="${TEXT:-1}"
 BASE="${BASE:-HuggingFaceVLA/smolvla_libero}"
 DATASET="${DATASET:-lerobot/libero}"
 DATASET_ROOT="${DATASET_ROOT:-}"
+VIDEO_BACKEND="${VIDEO_BACKEND:-}"
 LORA_TARGET="${LORA_TARGET:-vlm_mlp}"
 # --- overfit / training-extension knobs (direction 6) ---------------------------
 # EPISODES: train on ONLY these dataset episodes (single-task overfit). Format is a
@@ -409,6 +412,7 @@ python train_hyper_lora.py \
     "${MODE_ARGS[@]}" \
     --dataset.repo_id="$DATASET" \
     ${DATASET_ROOT:+--dataset.root=$DATASET_ROOT} \
+    ${VIDEO_BACKEND:+--dataset.video_backend=$VIDEO_BACKEND} \
     --dataset.use_imagenet_stats=false \
     --dataset.image_transforms.enable="$AUG_FLAG" \
     ${EPISODES:+--dataset.episodes=$EPISODES} \

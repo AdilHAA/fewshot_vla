@@ -63,18 +63,24 @@ src/libero_pro/            LIBERO-Pro поверх родного LIBERO (сью
 src/data/libero.py         обход бага file_index в lerobot/libero
 
 scripts/
-  setup.sh                   бутстрап окружения с нуля
-  train.sh / eval.sh         единые точки запуска; все ручки — env-переменными,
+  setup.sh                   бутстрап окружения с нуля (PYTHON_VERSION=3.12)
+  train.sh / eval.sh         единые точки запуска HN/LoRA/эвала; все ручки — env-переменными,
                              документированы в шапках самих скриптов
+  eval_all_8gpu.sh           та же eval-матрица, разложенная по картам (ASSIGN — ряд на карту)
+  summarize_matrix.py        сводка eval-матрицы (объединяет чанки libero_90_*, per-task таблица)
+  finetune_ours.sh           файнтьюн базы SmolVLA по рецепту статьи одной командой
+  args_finetune_ours.sh      его argv (датасет, train-эпизоды, база); source-ится лаунчером
+  prepare_base_smolvla_libero.py  копия lerobot/smolvla_base с LIBERO-фичами (старт файнтьюна)
+  push_hf.py                 залить чекпоинт / датасет на Hub (датасету ставит тег v3.0)
+  check_libero_merge.py      проверка совместимости с lerobot/libero + merge в один датасет
   render_recolor_clips.py    sim-аугментации демо: MuJoCo state-replay с перекраской
                              объектов / сдвигом камеры (движение то же, вид другой)
   build_xpair_cache.py       оффлайн-кеш эмбеддингов демонстраций (encode-once)
   build_frame_bank.py        банк t=0 кадров всех эпизодов
   make_libero90_split.py     фикс. сплит LIBERO-90: 40 train / 50 eval (configs/libero90_*.json)
-  prepare_base_smolvla_libero.py  копия smolvla_base с LIBERO-фичами (база ours)
-  libero90_episodes.py       эпизоды train-40 (--dataset.episodes) / чанки task_ids для эвала
-  rename_libero90_features.py  wrist_image → image2 в конвертированном LIBERO-90 v3.0
-  summarize_matrix.py        сводка eval-матрицы (понимает чанки libero_90_*, per-task)
+  libero90_episodes.py       чанки task_ids псевдосьютов libero_90_train/eval для eval.sh
+  prepare_nvidia_libero90.py / harmonize_libero90.py / flip_libero90_images.py /
+  rename_libero90_features.py  провенанс датасета Kesvill/libero_90_lerobot_v3 (см. MODEL_CARD)
   patch_lerobot.py           пост-инсталл фикс lerobot под transformers 5 / py3.12
   analyze_lora.py            зонд: зависят ли сгенерированные LoRA от задачи
 ```
@@ -87,7 +93,9 @@ scripts/
 
 ```bash
 git clone <repo> && cd fewshot_vla
+export PYTHON_VERSION=3.12   # lerobot 0.5.1 требует 3.12; в некоторых образах переменная уже = 3.11
 bash scripts/setup.sh
+source venv/bin/activate
 ```
 
 
@@ -136,24 +144,25 @@ pip uninstall -y torchaudio
 
 ## Этап LIBERO-90 held-out
 
-Датасет и базовая модель — на Hugging Face, инструкция для команды — `MODEL_CARD.md`
-(что внутри, конвенции, как трейнить/эвалить вместе с дефолтными сьютами):
+Датасет и базовая модель лежат на Hugging Face; всё, что нужно команде для работы с ними, —
+в `MODEL_CARD.md` (что внутри, конвенции, сценарии трейна/эвала вместе с дефолтными сьютами):
 [`Kesvill/libero_90_lerobot_v3`](https://huggingface.co/datasets/Kesvill/libero_90_lerobot_v3) ·
 [`Kesvill/smolvla_libero_90`](https://huggingface.co/Kesvill/smolvla_libero_90).
-Протокол этапа: `docs/experiments/2026-08-30-plan-libero90-heldout.md` в основном репо.
-Идея: база учится только на 40 задачах LIBERO-90 (сплит `configs/libero90_split.json`),
-остальные 50 + libero_10/goal/object/spatial — held-out; гиперсеть при полностью
-замороженной базе предсказывает LoRA только на action expert (`LORA_TARGET=expert_mlp`).
+Идея этапа (протокол: `docs/experiments/2026-08-30-plan-libero90-heldout.md` в основном репо):
+база учится только на train-сплите LIBERO-90 (40 задач по `configs/libero90_split.json`; в датасете
+после no-op фильтра их 39 — задачи 51 нет), остальные 50 задач + libero_10/goal/object/spatial —
+held-out; дальше гиперсеть при полностью замороженной базе предсказывает LoRA только на action
+expert (`LORA_TARGET=expert_mlp`).
 
 ```bash
 # данные + база (один раз)
 hf download Kesvill/libero_90_lerobot_v3 --repo-type dataset --local-dir outputs/libero90/libero_90_lerobot_v3
 python scripts/prepare_base_smolvla_libero.py --out outputs/base/smolvla_base_libero_io
 
-# файнтьюн базы: рецепт статьи (100k x batch 64, lr 1e-4 cosine -> 2.5e-6, bf16), 8 карт
+# файнтьюн базы на train-части: рецепт статьи (100k шагов, глобальный batch 64, lr 1e-4 cosine -> 2.5e-6, bf16)
 NPROC=8 STEPS=100000 OUT=outputs/smolvla_libero_90 bash scripts/finetune_ours.sh
 
-# eval: libero_90_train/eval — псевдосьюты (чанки по 10 задач) рядом с дефолтными сьютами
+# eval: libero_90_train/libero_90_eval — псевдосьюты (чанки по 10 задач) рядом с дефолтными
 POLICIES="ours=Kesvill/smolvla_libero_90" \
 TASKS="libero_90_train libero_90_eval libero_10 libero_goal libero_object libero_spatial" \
 SEEDS=1000 BATCH=10 bash scripts/eval.sh
@@ -163,15 +172,17 @@ python scripts/summarize_matrix.py outputs/eval_matrix --per_task libero_90_eval
 Результат базы (SR %, 50 эп./задачу): 90-train 74.8 · 90-eval 1.9 · libero_10 0.2 ·
 goal/object/spatial 0.0 · Pro lan/object/swap 0.0, task 7.6 — таблица и разбор в `MODEL_CARD.md`.
 
-Гиперсеть на этой базе: `BASE=Kesvill/smolvla_libero_90 DATASET=Kesvill/libero_90_lerobot_v3
-DATASET_ROOT=outputs/libero90/libero_90_lerobot_v3 LORA_TARGET=expert_mlp MODE=traj ...
-bash scripts/train.sh` — дефолтные argv старых армов не меняются.
+Гиперсеть на этой базе **пока не запускать**: резолв задачи по тексту инструкции и кеши демо
+(`build_xpair_cache.py`, `build_frame_bank.py`) рассчитаны на lerobot/libero; для LIBERO-90 нужен
+ключ задачи по `task_id` (74 текста на 90 задач) и пересборка кешей — это следующий шаг этапа.
+Ручки под него в `train.sh` уже есть: `BASE=`, `DATASET=`, `DATASET_ROOT=`, `VIDEO_BACKEND=pyav`,
+`EPISODES=` (список эпизодов из `train_episodes.json`), `LORA_TARGET=expert_mlp`.
 
-Провенанс датасета (повторять не нужно): `scripts/prepare_nvidia_libero90.py`
-(NVIDIA no-op LIBERO-90 → rename камер → гриппер 0/1→±1 → task_id по совпадению действий с
-yzembodied → списки эпизодов сплита → проверка ориентации); `scripts/make_libero90_split.py`,
-`scripts/flip_libero90_images.py` и `scripts/rename_libero90_features.py` — инструменты той же
-цепочки.
+Провенанс датасета (повторять не нужно): `scripts/prepare_nvidia_libero90.py` (NVIDIA no-op
+LIBERO-90 → камеры → гриппер 0/1→±1 → task_id по совпадению действий с yzembodied → списки
+эпизодов сплита → проверка ориентации кадров) и `scripts/harmonize_libero90.py` (fps/схема как у
+lerobot/libero); `make_libero90_split.py`, `flip_libero90_images.py`, `rename_libero90_features.py`
+— инструменты той же цепочки.
 
 ## FYI
 Пока забейте и не смотрите на код связанный с ретривалом/кондишенингом траекторий целых, там буду переделывать

@@ -4,7 +4,7 @@
   python scripts/push_hf.py dataset outputs/libero90/nvidia/libero_90 USER/libero_90_lerobot_v3
 
 Auth: `export HF_TOKEN=hf_...` (a write token) — the stored login is not touched.
-Datasets get the `v3.0` tag LeRobotDataset resolves by default; `--private` for a
+Datasets get the `v3.0` tag LeRobotDataset resolves by default (moved to the new commit on re-upload); `--private` for a
 private repo (readable only by org members).
 """
 import argparse
@@ -37,7 +37,9 @@ def main():
         api.upload_file(repo_id=args.repo, repo_type=args.kind, path_or_fileobj=args.readme,
                         path_in_repo="README.md", commit_message="readme")
     if args.kind == "dataset":
-        api.create_tag(args.repo, repo_type="dataset", tag="v3.0", exist_ok=True)
+        # LeRobotDataset resolves revision "v3.0": the tag must point at THIS upload
+        api.delete_tag(args.repo, repo_type="dataset", tag="v3.0")
+        api.create_tag(args.repo, repo_type="dataset", tag="v3.0")
     print(f"https://huggingface.co/{'datasets/' if args.kind == 'dataset' else ''}{args.repo}")
 
 

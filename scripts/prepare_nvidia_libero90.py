@@ -142,7 +142,7 @@ def map_tasks(root, reference, split_path):
         if part == "eval" and missing:
             raise SystemExit("eval tasks missing from the NVIDIA data — split would change")
     (root / "episode_task_map.json").write_text(json.dumps(
-        {"revision": REV, "reference": str(Path(reference).resolve()),
+        {"revision": REV, "reference": "yzembodied/libero_90_image",
          "episode_to_task": mapping, "episode_to_reference_episode": ref_ep}, indent=1) + "\n")
     return ref_ep
 

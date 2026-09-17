@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Launch the smolvla_libero_ours finetune (probe or full) with ONE short command —
+# Launch the base finetune on LIBERO-90 (probe or full) with ONE short command —
 # long pasted lines get split by the cluster terminal. Prints the exact argv first.
 #
 #   NPROC=4 STEPS=300    OUT=outputs/ddp_probe_v2           LOCAL_CACHE=1 bash scripts/finetune_ours.sh
-#   NPROC=4 STEPS=100000 OUT=outputs/smolvla_libero_ours_v2 LOCAL_CACHE=1 bash scripts/finetune_ours.sh
-#   NPROC=1 STEPS=100000 OUT=outputs/smolvla_libero_ours_v2 GPUS=4 bash scripts/finetune_ours.sh
+#   NPROC=8 STEPS=100000 OUT=outputs/smolvla_libero_90 bash scripts/finetune_ours.sh
+#   NPROC=1 STEPS=100000 OUT=outputs/smolvla_libero_90 GPUS=4 bash scripts/finetune_ours.sh
 #
 # Env knobs:
 #   NPROC (1)        processes/GPUs; >1 = accelerate --multi_gpu (NCCL P2P/IB off — SHM works here)
 #   GPUS  ()         CUDA_VISIBLE_DEVICES, e.g. "0,1,2,3" or "4"; empty = all visible
 #   STEPS (100000)   training steps
-#   OUT   (outputs/smolvla_libero_ours_v2)   output dir (must not exist)
+#   OUT   (outputs/smolvla_libero_90)   output dir (must not exist)
 #   BATCH ()         per-process batch; default 64 for NPROC=1, 16 for NPROC=4 (global 64)
 #   LOCAL_CACHE (0)  1 = read models/arrow cache/base ckpt from /tmp/local/{hub,datasets,base_io}
 #                    (copies made with cp -r; NFS hung under concurrent multi-rank mmap reads)
@@ -23,7 +23,7 @@ source venv/bin/activate
 
 NPROC="${NPROC:-1}"
 STEPS="${STEPS:-100000}"
-OUT="${OUT:-outputs/smolvla_libero_ours_v2}"
+OUT="${OUT:-outputs/smolvla_libero_90}"
 if [ -z "${BATCH:-}" ]; then [ "$NPROC" = "1" ] && BATCH=64 || BATCH=$((64 / NPROC)); fi
 if [ -e "$OUT" ]; then echo "ERROR: $OUT exists — rm -rf it or pick another OUT" >&2; exit 1; fi
 

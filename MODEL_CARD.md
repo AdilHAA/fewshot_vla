@@ -1,101 +1,100 @@
-# smolvla_libero_ours — SmolVLA, дообученная на LIBERO-90 (train-40)
+# LIBERO-90 для lerobot + SmolVLA, обученная на его train-части
 
-Мини-инструкция для команды: что это за чекпоинт, где лежит, как его гонять и как
-работать с нашим датасетом LIBERO-90, чтобы ставить свои эксперименты поверх.
-Код: репо `fewshot_vla` (все команды — из его корня, `source venv/bin/activate`).
-
-## 1. Что это
+Два артефакта на Hugging Face:
 
 | | |
 |---|---|
-| База | `lerobot/smolvla_base` (SmolVLM2-500M-Video-Instruct, **16 слоёв LLM**, action expert ×0.75 = hidden 720, 16 слоёв) |
-| Данные | LIBERO-90, **40 задач** (train-сплит, 2000 демо); остальные 50 задач + libero_10/goal/object/spatial никогда не видела |
-| Рецепт | статья SmolVLA §4.3: VLM заморожен, учится только action expert (+ state/action-проекции); 100k шагов, глобальный batch 64, lr 1e-4 → cosine 2.5e-6 на весь горизонт, bf16, картинки 512×512, chunk 50 |
-| Эвал-протокол | `n_action_steps=1` (запечён в config.json), 10 flow-шагов, 50 эпизодов/задачу, seed 1000 |
-| I/O | `observation.images.image` (agentview), `observation.images.image2` (wrist), `observation.state[8]`, `action[7]` — как у `HuggingFaceVLA/smolvla_libero` и env-обёртки lerobot |
+| датасет | [`Kesvill/libero_90_lerobot_v3`](https://huggingface.co/datasets/Kesvill/libero_90_lerobot_v3) — LIBERO-90 в формате lerobot v3.0, готовый к `lerobot/libero`-совместимому трейну и эвалу |
+| модель | [`Kesvill/smolvla_libero_90`](https://huggingface.co/Kesvill/smolvla_libero_90) — SmolVLA (`lerobot/smolvla_base`), дообученная по рецепту статьи на 39 задачах train-сплита |
 
-Версии: **v2** (`smolvla_libero_ours_v2`) обучена на исправленном датасете и работает
-с env напрямую — используйте её. **v1** (`smolvla_libero_ours`) обучена на зеркальном
-датасете (см. §4) и корректна только с `EVAL_FLIP_LR="observation.images.image observation.images.image2"`
-на эвале — для новых экспериментов не брать.
+Код: репо `fewshot_vla` (`bash scripts/setup.sh && source venv/bin/activate`, команды из корня).
 
-## 2. Где лежит
+## Датасет
 
-```
-<SHARE>/artifacts/smolvla_libero_ours_v2/pretrained_model/   # config.json, model.safetensors, policy_pre/postprocessor.json, train_config.json
-<SHARE>/artifacts/libero_90_image_flipped/                   # датасет lerobot v3.0, 4500 эп., ~30 ГБ
-<SHARE>/artifacts/libero90_split.json                        # фиксированный сплит 40/50 (копия configs/ из репо)
-```
-`<SHARE>` = `/home/jovyan/shares/SR004.nfs2/skripkin` (см. §6, как выложить/обновить).
-Чекпоинт — обычный lerobot-чекпоинт: `SmolVLAPolicy.from_pretrained(path)` или `--policy.path=path`.
+**Что внутри.** Оригинальные демонстрации LIBERO-90 (90 задач, 20 сцен) после no-op фильтра
+OpenVLA — 3921 эпизод, 569 249 кадров (задача 51 `pick up the butter and put it in the basket`
+фильтром выпала целиком). Видео AV1 256×256, обе камеры. Схема как у `lerobot/libero`:
 
-## 3. Результаты
+| ключ | форма | смысл |
+|---|---|---|
+| `observation.images.image` | 256×256×3 | agentview |
+| `observation.images.image2` | 256×256×3 | wrist |
+| `observation.state` | 8 | eef xyz + axis-angle + 2 гриппер |
+| `action` | 7 | OSC delta xyz/rpy + гриппер **+1 = закрыть, −1 = открыть** (конвенция robosuite/lerobot/env) |
 
-Заполняется из `python scripts/summarize_matrix.py outputs/eval_matrix_v2 --per_task libero_90_eval`
-(mean success rate, %, 50 эп./задачу, seed 1000):
+Кадры — в конвенции env-обёртки lerobot (то, что политика видит на эвале): никаких
+поворотов и флипов при обучении и эвале не нужно.
 
-| policy | 90-train (40 виденных) | 90-eval (50 held-out) | libero_10 | goal | object | spatial | Pro lan | Pro object | Pro swap | Pro task |
-|---|---|---|---|---|---|---|---|---|---|---|
-| smolvla_libero_ours_v2 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+**Сплит.** В корне датасета:
 
-Ориентиры: на 2 train-задачах × 20 эп. v1 с правильной конвенцией кадров дала 92.5–97.5%;
-по 4 чанкам train — ~80%. Все OOD-сьюты у базы ожидаемо низкие — это и есть
-пространство для методов адаптации (гиперсеть, LoRA по демо и т.п.).
+- `train_episodes.json` — 1733 эпизода, 39 задач (train-40 из `configs/libero90_split.json` минус 51);
+- `eval_episodes.json` — 2188 эпизодов, 50 held-out задач;
+- `episode_task_map.json` — `episode_index → task_id` бенчмарка (порядок `libero_task_map["libero_90"]`, он же `--env.task_ids` у lerobot-eval).
 
-## 4. Датасет LIBERO-90: конвенции и грабли
+Сплит сделан сидом 42 со стратификацией по 20 сценам; 14 задач LIBERO-90, которые являются
+подшагами задач LIBERO-10, принудительно в train. **Не ключуйте задачи по тексту**: у 90 задач
+только 74 уникальные инструкции, `task_index` датасета их склеивает — используйте `task_id`.
 
-- Источник: `yzembodied/libero_90_image` (оригинальные 4500 демо LIBERO-90, v2.1) →
-  `convert_dataset_v21_to_v30` → `scripts/rename_libero90_features.py` (wrist_image→image2)
-  → **`scripts/flip_libero90_images.py` по обеим камерам**. Без флипа кадры зеркальны
-  относительно рендера env: политика на них даёт 25–40% на своих же задачах вместо 80+.
-  Не учитесь на `libero_90_image` (нефлипнутом) — только на `libero_90_image_flipped`.
-- `episode_index // 50 == task_id` бенчмарка (порядок `libero_task_map["libero_90"]`,
-  он же порядок `--env.task_ids` у lerobot-eval). Список train-эпизодов:
-  `python scripts/libero90_episodes.py --part train` (2000 id для `--dataset.episodes`).
-- **74 уникальные инструкции на 90 задач** (12 текстов делят 28 задач в разных сценах).
-  Ключуйте задачи по `task_id`, не по тексту: `task_index` датасета и любой резолв «по
-  инструкции» на LIBERO-90 подмешает чужую сцену.
-- Метка `fps=20` в info.json — просто метка: кадров столько же, сколько в lerobot/libero
-  (median 141 на эпизод, max 373 < горизонта 400). No-op кадров 0.5% — фильтр не нужен.
-- Сплит `configs/libero90_split.json` (сид 42, стратификация по 20 сценам, 14 подзадач
-  LIBERO-10 принудительно в train, поле `twin_ids` — текстовые близнецы). Псевдосьюты
-  `libero_90_train` / `libero_90_eval` в `scripts/eval.sh` читают его сами.
-- Первое открытие датасета строит arrow-кеш (~20 мин, десятки ГБ в `$HF_DATASETS_CACHE`);
-  запускайте обучение через `train_hyper_lora.py` (обёртка над lerobot-train): в ней
-  починены нестабильный fingerprint кеша, O(N)-цикл с декодом картинок при инициализации
-  (20 мин на процесс, в DDP выглядел как вечный вис) и таймаут барьера. Голый
-  `lerobot-train` на этом датасете эти грабли соберёт заново.
+**Как собран** (провенанс, повторять не нужно): `scripts/prepare_nvidia_libero90.py` —
+`nvidia/LIBERO_LeRobot_v3/libero_90` (ревизия `e590737`) → `wrist_image→image2` → гриппер
+`0/1 → ±1` в данных и stats → `task_id` по побайтовому совпадению последовательностей действий с
+`yzembodied/libero_90_image` (у NVIDIA нумерация эпизодов не по задачам) → проверка ориентации
+кадров против эталона входа политики.
 
-## 5. Как использовать
-
-Эвал (одна карта, любой набор сьютов; матрица резюмируемая):
-```bash
-POLICIES="ours_v2=<SHARE>/artifacts/smolvla_libero_ours_v2/pretrained_model" \
-TASKS="libero_90_eval libero_10 libero_goal libero_object libero_spatial" SEEDS=1000 BATCH=10 \
-OUT_ROOT=outputs/my_eval bash scripts/eval.sh
-```
-Все 8 карт сразу: `bash scripts/eval_all_8gpu.sh ours_v2=<path>` (раскладка в `ASSIGN`).
-
-Свой файнтьюн от нашей базы или от smolvla_base (рецепт статьи, одна короткая команда):
-```bash
-BASE_PATH=<SHARE>/artifacts/smolvla_libero_ours_v2/pretrained_model \
-DATA_ROOT=<SHARE>/artifacts/libero_90_image_flipped \
-NPROC=8 STEPS=100000 OUT=outputs/my_finetune bash scripts/finetune_ours.sh
-```
-(`NPROC` карт, глобальный батч 64 держится автоматически; `BATCH`, `GPUS`, `WORKERS` — ручки.)
-
-Гиперсеть/LoRA поверх замороженной базы — `scripts/train.sh` с `BASE=<path>`,
-`DATASET_ROOT=<...>/libero_90_image_flipped`, `LORA_TARGET=expert_mlp` (см. README репо).
-
-## 6. Выложить/обновить артефакты на шару
+## Использовать как обычный lerobot-датасет
 
 ```bash
-SHARE=/home/jovyan/shares/SR004.nfs2/skripkin
-mkdir -p $SHARE/artifacts/smolvla_libero_ours_v2
-rsync -aL outputs/smolvla_libero_ours_v2/checkpoints/last/pretrained_model/ $SHARE/artifacts/smolvla_libero_ours_v2/pretrained_model/
-rsync -a outputs/libero90/libero_90_image_flipped/ $SHARE/artifacts/libero_90_image_flipped/
-cp configs/libero90_split.json $SHARE/artifacts/
-cp docs/MODEL_CARD_smolvla_libero_ours.md $SHARE/artifacts/README.md   # в fewshot_vla файл лежит в корне как MODEL_CARD.md
-chmod -R a+rX $SHARE/artifacts
+hf download Kesvill/libero_90_lerobot_v3 --repo-type dataset --local-dir outputs/libero90/libero_90_lerobot_v3
 ```
-(`-L` разыменовывает симлинк `last` → реальный каталог шага.)
+
+Train (любой lerobot-политикой; наш рецепт — ниже) на train-части:
+
+```bash
+--dataset.repo_id=Kesvill/libero_90_lerobot_v3 --dataset.root=outputs/libero90/libero_90_lerobot_v3 \
+--dataset.episodes="$(cat outputs/libero90/libero_90_lerobot_v3/train_episodes.json)" --dataset.video_backend=pyav
+```
+
+Eval — стоковый lerobot-eval с `--env.task=libero_90 --env.task_ids=[...]` (id из
+`configs/libero90_split.json`). В `scripts/eval.sh` это два псевдосьюта `libero_90_train` и
+`libero_90_eval`, которые гоняются чанками по 10 задач рядом с дефолтными:
+
+```bash
+POLICIES="my=<путь или HF id>" TASKS="libero_90_train libero_90_eval libero_10 libero_goal libero_object libero_spatial" \
+SEEDS=1000 BATCH=10 OUT_ROOT=outputs/my_eval bash scripts/eval.sh
+python scripts/summarize_matrix.py outputs/my_eval --per_task libero_90_eval
+```
+
+Все 8 карт сразу — `scripts/eval_all_8gpu.sh` (раскладка по картам в `ASSIGN`). Первое открытие
+датасета строит arrow-кеш (минуты; у video-датасета он маленький); обучение запускайте через
+`train_hyper_lora.py` — обёртку над lerobot-train, в которой починены нестабильный fingerprint
+кеша и построчный декод картинок при инициализации (иначе старт 20 мин на процесс и вис DDP).
+
+## Модель `smolvla_libero_90`
+
+| | |
+|---|---|
+| база | `lerobot/smolvla_base`: SmolVLM2-500M-Video-Instruct, 16 слоёв LLM, action expert ×0.75 (hidden 720, 16 слоёв) |
+| данные | train-часть датасета выше: 39 задач, 1733 эпизода |
+| рецепт | статья SmolVLA §4.3: VLM заморожен, учится только action expert (+ state/action-проекции); 100k шагов, глобальный batch 64 (8×A100, по 8 на карту), lr 1e-4 → cosine 2.5e-6 на весь горизонт, bf16, картинки 512×512, chunk 50 |
+| I/O | `image`, `image2`, `state[8]` → `action[7]`; `n_action_steps=1` запечён в `config.json` |
+| воспроизвести | `python scripts/prepare_base_smolvla_libero.py --out outputs/base/smolvla_base_libero_io` (копия smolvla_base с LIBERO-фичами), затем `NPROC=8 STEPS=100000 OUT=outputs/my_run bash scripts/finetune_ours.sh` |
+
+Загрузка: `--policy.path=Kesvill/smolvla_libero_90` или `SmolVLAPolicy.from_pretrained(...)`.
+
+**Результаты** (success rate %, 50 эпизодов/задачу, seed 1000, 10 flow-шагов):
+
+| сьют | задач | SR |
+|---|---|---|
+| libero_90_train (виденные) | 40 | **74.8** |
+| libero_90_eval (held-out, те же сцены) | 50 | **1.9** |
+| libero_10 | 10 | 0.2 |
+| libero_goal | 10 | 0.0 |
+| libero_object | 10 | 0.0 |
+| libero_spatial | 10 | 0.0 |
+| LIBERO-Pro libero_10 lan / object / swap / task | 10 | 0.0 / 0.0 / 0.0 / 7.6 |
+
+Задача 51 в `libero_90_train` не входила в обучение (нет в датасете) и даёт 64% — перенос
+внутри сцены от задач 50/54. Для сравнения `HuggingFaceVLA/smolvla_libero` (училась на 4
+сьютах): libero_10 41.8, goal 84.2, object 91.0, spatial 77.4; Pro lan 0.0, object 18.8,
+swap 0.0, task 0.0. Вывод: база, обученная на 40 задачах LIBERO-90, не переносится ни на новые
+задачи в виденных сценах, ни на другие сьюты — это пространство для методов адаптации.

@@ -136,65 +136,42 @@ pip uninstall -y torchaudio
 
 ## Этап LIBERO-90 held-out
 
-**Чекпоинт `smolvla_libero_ours` + датасет LIBERO-90 для команды:** `MODEL_CARD.md` (где лежит, конвенции, как гонять/дообучать).
-
-Протокол: `docs/experiments/2026-08-30-plan-libero90-heldout.md` в основном репо
-(HyperNetwork-LoRA-for-VLA-Adaptation). База `smolvla_libero_ours` файнтьюнится из
-`lerobot/smolvla_base` на 40 задачах LIBERO-90 (сплит в `configs/libero90_split.json`),
+Датасет и базовая модель — на Hugging Face, инструкция для команды — `MODEL_CARD.md`
+(что внутри, конвенции, как трейнить/эвалить вместе с дефолтными сьютами):
+[`Kesvill/libero_90_lerobot_v3`](https://huggingface.co/datasets/Kesvill/libero_90_lerobot_v3) ·
+[`Kesvill/smolvla_libero_90`](https://huggingface.co/Kesvill/smolvla_libero_90).
+Протокол этапа: `docs/experiments/2026-08-30-plan-libero90-heldout.md` в основном репо.
+Идея: база учится только на 40 задачах LIBERO-90 (сплит `configs/libero90_split.json`),
 остальные 50 + libero_10/goal/object/spatial — held-out; гиперсеть при полностью
 замороженной базе предсказывает LoRA только на action expert (`LORA_TARGET=expert_mlp`).
 
 ```bash
-# 1) данные: LIBERO-90 (yzembodied = оригинальные 4500 демо, episode//50 == task_id) -> v3.0
-hf download yzembodied/libero_90_image --repo-type dataset --local-dir outputs/libero90/libero_90_image
-python -m lerobot.scripts.convert_dataset_v21_to_v30 --repo-id yzembodied/libero_90_image \
-    --root "$PWD/outputs/libero90/libero_90_image" --push-to-hub false
-python scripts/rename_libero90_features.py --root outputs/libero90/libero_90_image
-# yzembodied хранит agentview ЗЕРКАЛЬНО (по горизонтали) относительно рендера env lerobot —
-# политика на таких кадрах даёт 25-40% на своих же задачах против 92% при совпадающей
-# конвенции; зеркальны ОБЕ камеры (проба: флип agentview 92.5%, обеих 97.5%). Чиним датасет один раз:
-python scripts/flip_libero90_images.py --root outputs/libero90/libero_90_image \
-    --out outputs/libero90/libero_90_image_flipped \
-    --keys observation.images.image observation.images.image2
-# дальше везде --dataset.root=.../libero_90_image_flipped
-# no-op-фильтрованный вариант тех же демо (nvidia/LIBERO_LeRobot_v3/libero_90, OpenVLA-фильтр:
-# 3921 эп., задача 51 отсутствует). Скрипт: скачать -> wrist_image->image2 -> гриппер 0/1 -> ±1 ->
-# task_id по совпадению действий с yzembodied -> train_episodes.json -> проверка ориентации кадров
-python scripts/prepare_nvidia_libero90.py --out outputs/libero90/nvidia --reference outputs/libero90/libero_90_image_flipped
-# обучение на нём: EPISODES_FILE=outputs/libero90/nvidia/libero_90/train_episodes.json DATA_ROOT=outputs/libero90/nvidia/libero_90 \
-#   DATA_REPO=nvidia/LIBERO_LeRobot_v3 VIDEO_BACKEND=pyav NPROC=8 OUT=outputs/smolvla_libero_nvidia bash scripts/finetune_ours.sh
-python scripts/make_libero90_split.py --verify_against_libero   # сверка снапшота реестра
-
-# 2) файнтьюн ours: рецепт статьи (100k x batch 64, lr 1e-4 cosine -> 2.5e-6, bf16)
+# данные + база (один раз)
+hf download Kesvill/libero_90_lerobot_v3 --repo-type dataset --local-dir outputs/libero90/libero_90_lerobot_v3
 python scripts/prepare_base_smolvla_libero.py --out outputs/base/smolvla_base_libero_io
-EPIS="$(python scripts/libero90_episodes.py --part train)"      # 40 задач x 50 = 2000 эпизодов
-ARGS=(
-    --policy.path=outputs/base/smolvla_base_libero_io
-    --policy.push_to_hub=false --policy.device=cuda
-    --policy.scheduler_decay_steps=100000
-    --dataset.repo_id=yzembodied/libero_90_image
-    --dataset.root="$PWD/outputs/libero90/libero_90_image"
-    --dataset.use_imagenet_stats=false
-    --dataset.episodes="$EPIS"
-    --batch_size=64 --num_workers=12
-    --save_freq=10000 --save_checkpoint=true --seed=42
-    --wandb.enable=true
-)
-TENSORBOARD=1 accelerate launch --num_processes=1 --mixed_precision=bf16 \
-    train_hyper_lora.py "${ARGS[@]}" --steps=200 --output_dir=outputs/smoke_ours      # смоук
-TENSORBOARD=1 accelerate launch --num_processes=1 --mixed_precision=bf16 \
-    train_hyper_lora.py "${ARGS[@]}" --steps=100000 --output_dir=outputs/smolvla_libero_ours
 
-# 3) eval (libero_90_train/eval — псевдосьюты eval.sh, чанками по 10 задач)
-POLICIES="ours=outputs/smolvla_libero_ours/checkpoints/last/pretrained_model" \
+# файнтьюн базы: рецепт статьи (100k x batch 64, lr 1e-4 cosine -> 2.5e-6, bf16), 8 карт
+NPROC=8 STEPS=100000 OUT=outputs/smolvla_libero_90 bash scripts/finetune_ours.sh
+
+# eval: libero_90_train/eval — псевдосьюты (чанки по 10 задач) рядом с дефолтными сьютами
+POLICIES="ours=Kesvill/smolvla_libero_90" \
 TASKS="libero_90_train libero_90_eval libero_10 libero_goal libero_object libero_spatial" \
-SEEDS="1000" bash scripts/eval.sh
+SEEDS=1000 BATCH=10 bash scripts/eval.sh
 python scripts/summarize_matrix.py outputs/eval_matrix --per_task libero_90_eval
 ```
 
-Гиперсеть на новой базе (после файнтьюна): `BASE=<ckpt ours> DATASET=yzembodied/libero_90_image
-DATASET_ROOT=outputs/libero90/libero_90_image LORA_TARGET=expert_mlp MODE=traj ...
+Результат базы (SR %, 50 эп./задачу): 90-train 74.8 · 90-eval 1.9 · libero_10 0.2 ·
+goal/object/spatial 0.0 · Pro lan/object/swap 0.0, task 7.6 — таблица и разбор в `MODEL_CARD.md`.
+
+Гиперсеть на этой базе: `BASE=Kesvill/smolvla_libero_90 DATASET=Kesvill/libero_90_lerobot_v3
+DATASET_ROOT=outputs/libero90/libero_90_lerobot_v3 LORA_TARGET=expert_mlp MODE=traj ...
 bash scripts/train.sh` — дефолтные argv старых армов не меняются.
+
+Провенанс датасета (повторять не нужно): `scripts/prepare_nvidia_libero90.py`
+(NVIDIA no-op LIBERO-90 → rename камер → гриппер 0/1→±1 → task_id по совпадению действий с
+yzembodied → списки эпизодов сплита → проверка ориентации); `scripts/make_libero90_split.py`,
+`scripts/flip_libero90_images.py` и `scripts/rename_libero90_features.py` — инструменты той же
+цепочки.
 
 ## FYI
 Пока забейте и не смотрите на код связанный с ретривалом/кондишенингом траекторий целых, там буду переделывать

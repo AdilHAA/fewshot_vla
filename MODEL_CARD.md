@@ -70,7 +70,8 @@ python scripts/summarize_matrix.py outputs/my_eval --per_task libero_90_eval
 
 Все 8 карт сразу — `scripts/eval_all_8gpu.sh` (раскладка по картам в `ASSIGN`).
 
-Совместный трейн с дефолтным LIBERO — один смерженный датасет:
+Совместный трейн с дефолтным LIBERO — один смерженный датасет (проверка совместимости и merge одной
+командой: `python scripts/check_libero_merge.py --merge`, результат в `outputs/libero90/libero_all`; то же руками:)
 
 ```bash
 hf download lerobot/libero --repo-type dataset --revision v3.0 --local-dir outputs/libero90/lerobot_libero

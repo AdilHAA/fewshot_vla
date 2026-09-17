@@ -38,7 +38,8 @@ def main():
                         path_in_repo="README.md", commit_message="readme")
     if args.kind == "dataset":
         # LeRobotDataset resolves revision "v3.0": the tag must point at THIS upload
-        api.delete_tag(args.repo, repo_type="dataset", tag="v3.0")
+        if "v3.0" in {t.name for t in api.list_repo_refs(args.repo, repo_type="dataset").tags}:
+            api.delete_tag(args.repo, repo_type="dataset", tag="v3.0")
         api.create_tag(args.repo, repo_type="dataset", tag="v3.0")
     print(f"https://huggingface.co/{'datasets/' if args.kind == 'dataset' else ''}{args.repo}")
 

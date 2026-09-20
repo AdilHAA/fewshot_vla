@@ -6,8 +6,12 @@ from each half of the result.
   python scripts/check_libero_merge.py --merge         # + build outputs/libero90/libero_all and open it
 """
 import argparse
+import os
+import shutil
+import tempfile
 from pathlib import Path
 
+from lerobot.datasets import aggregate
 from lerobot.datasets.aggregate import validate_all_metadata
 from lerobot.datasets.dataset_tools import merge_datasets
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -39,7 +43,16 @@ def main():
     out = Path(args.out)
     if out.exists():
         raise SystemExit(f"{out} exists — remove it first")
+    # lerobot seeds every merged video file with shutil.copy, which carries the
+    # source's mode bits over: hub-cache files are read-only, so appending the next
+    # source file (write into that copy) fails. Copy without the mode (process-wide
+    # patch; this CLI does nothing else). The temp mp4 of each append is then renamed
+    # into place, so keep it on the output filesystem, not /tmp.
+    aggregate.shutil.copy = lambda src, dst: (shutil.copyfile(src, dst), os.chmod(dst, 0o644))[0]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = tempfile.mkdtemp(prefix="merge_tmp_", dir=out.parent)
     merged = merge_datasets(datasets, "local/libero_all", out)
+    shutil.rmtree(tempfile.tempdir, ignore_errors=True)
     n = sum(d.meta.total_episodes for d in datasets)
     assert merged.meta.total_episodes == n, (merged.meta.total_episodes, n)
     print(f"merged: episodes={merged.meta.total_episodes} frames={merged.meta.total_frames} "

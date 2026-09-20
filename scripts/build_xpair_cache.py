@@ -3,20 +3,29 @@ sim-recolor / camera-jitter variants) into the ragged trajectory cache
 (tokens.mmap + index.json). build_records/make_chunked are pure and unit-tested.
 
   python scripts/build_xpair_cache.py --encoder dino   --out outputs/xpair_cache/dino \
-      --rendered_dir outputs/rendered_recolor
+      --rendered_dir outputs/rendered_recolor --legacy_keys
   python scripts/build_xpair_cache.py --encoder vjepa2 --out outputs/xpair_cache/vjepa2 \
-      --rendered_dir outputs/rendered_recolor
+      --rendered_dir outputs/rendered_recolor --legacy_keys
+
+Merged LIBERO-90 + lerobot/libero dataset (local root, task identity from the
+episode_keys sidecar rather than the dataset's text-derived task_index):
+  python scripts/build_xpair_cache.py --encoder dino --out outputs/xpair_cache/dino90 \
+      --repo_id local/libero_all --root outputs/libero90/libero_all \
+      --video_backend pyav --keys outputs/libero90/libero_all/episode_keys.json \
+      --episodes outputs/libero90/hn_train_episodes.json
 
 Sharded build (one GPU per shard, then a cheap CPU merge; the merged cache is
 byte-identical to an unsharded build):
   for i in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$i python scripts/build_xpair_cache.py \
-      --encoder vjepa2 --out outputs/xpair_cache/vjepa2 --shard $i --num_shards 4 & done; wait
+      --encoder vjepa2 --out outputs/xpair_cache/vjepa2 --shard $i --num_shards 4 \
+      --legacy_keys & done; wait
   python scripts/build_xpair_cache.py --encoder vjepa2 --out outputs/xpair_cache/vjepa2 \
       --merge_shards 4
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -32,6 +41,51 @@ from src.traj_data.encoder import (DINO_SIDE, build_traj_encoder, default_model_
                                    derive_tokens, encoder_format, parse_format)
 
 
+def add_dataset_args(p):
+    """Dataset-source flags shared by every cache builder (build_qwen35_video_cache
+    imports these too, so the two can never drift on which episodes they encode)."""
+    p.add_argument("--repo_id", default="lerobot/libero")
+    p.add_argument("--revision", default="v3.0")
+    p.add_argument("--root", default=None,
+                   help="local LeRobotDataset root (e.g. the merged libero_all "
+                        "build); the hub revision is then not used")
+    p.add_argument("--video_backend", default=None,
+                   help="lerobot decoder; 'pyav' for the AV1 LIBERO videos")
+    p.add_argument("--episodes", default=None,
+                   help="json file: episode_index list the build is restricted to")
+    p.add_argument("--keys", default=None,
+                   help="episode_keys.json (scripts/make_episode_keys.py): "
+                        "episode_index -> LIBERO bddl stem, stamped on every record")
+    p.add_argument("--legacy_keys", action="store_true",
+                   help="write pre-registry task_index records instead of task_key "
+                        "ones (only valid where task_index IS the task, i.e. the "
+                        "unmerged lerobot/libero dataset)")
+
+
+def dataset_kwargs(args) -> dict:
+    """The shared source flags as `_load_episodes` kwargs."""
+    if not args.legacy_keys and not args.keys:
+        raise SystemExit(
+            "--keys <episode_keys.json> is required: the merged dataset's task_index "
+            "is rebuilt from instruction TEXT and merges same-sentence tasks. Build "
+            "one with scripts/make_episode_keys.py, or pass --legacy_keys.")
+    if args.legacy_keys and (args.keys or args.root):
+        raise SystemExit(
+            "--legacy_keys is only valid for the unmerged Hub lerobot/libero dataset "
+            "(where task_index IS the task); a local --root is a merged build — pass "
+            "--keys instead, not both.")
+    keys = None
+    if not args.legacy_keys:
+        with open(args.keys) as fh:
+            keys = {int(k): v for k, v in json.load(fh)["episode_to_key"].items()}
+    eps = None
+    if args.episodes:
+        with open(args.episodes) as fh:
+            eps = [int(e) for e in json.load(fh)]
+    return {"root": args.root, "video_backend": args.video_backend,
+            "episodes": eps, "keys": keys}
+
+
 def make_chunked(encode, chunk: int, even: bool = False):
     """Encode long clips in fixed-size temporal chunks and concat along tokens.
     even=True trims the clip to an even frame count first (vjepa2 tubelet=2)."""
@@ -44,19 +98,35 @@ def make_chunked(encode, chunk: int, even: bool = False):
     return _enc
 
 
+def _task_of(ep):
+    """(record task fields, task_texts key) of a source episode.
+
+    A registry build stamps the bddl stem (`task_key`); a --legacy_keys build keeps
+    the dataset's `task_index`, which is only a task identity on a dataset that was
+    not merged (the merged one rebuilds task_index from instruction text)."""
+    k = ep.get("task_key")
+    if k is None:
+        return {"task_index": int(ep["task_index"])}, int(ep["task_index"])
+    return {"task_key": str(k)}, str(k)
+
+
 def iter_records(episodes, encode, extra_variants=None, task_texts=None):
     """Yield (tokens (L,d) fp16, record) per episode/variant, one at a time.
 
     A generator, not a list: the raw-patch build is 108 GB of tokens and must never
-    be held in memory. `task_texts`, if given, is filled in as a side effect."""
+    be held in memory. `task_texts`, if given, is filled in as a side effect.
+    `src_len` is the frame count of the clip behind the record — the trunk arm needs
+    it to recompute the frame indices (and hence the prompt timestamps) of a strided
+    encode without touching the dataset again."""
     def _emit(ep, clip, variant):
         toks = encode(clip.unsqueeze(0))[0].cpu().numpy().astype(np.float16)
+        fields, _ = _task_of(ep)
         return toks, {"episode": ep["episode"], "variant": variant,
-                      "task_index": ep["task_index"]}
+                      "src_len": int(clip.shape[0]), **fields}
 
     for ep in episodes:
         if task_texts is not None:
-            task_texts.setdefault(int(ep["task_index"]), ep["instruction"])
+            task_texts.setdefault(_task_of(ep)[1], ep["instruction"])
         yield _emit(ep, ep["frames"], 0)
         if extra_variants is not None:
             for variant, clip in extra_variants(ep["episode"]):
@@ -83,8 +153,6 @@ def merge_shards(out_dir: str, shard_dirs: list) -> tuple:
     """Concatenate per-shard ragged caches into one at out_dir, re-sorted by
     (episode, variant) so the result equals an unsharded build. Streaming
     mmap-to-mmap copy; headers must agree across shards."""
-    import json
-
     metas = []
     for d in shard_dirs:
         with open(os.path.join(d, "index.json")) as fh:
@@ -114,14 +182,15 @@ def merge_shards(out_dir: str, shard_dirs: list) -> tuple:
         for k in ("chunk", "encoder_model"):              # keep a recorded value
             if hdr.get(k) is None and h.get(k) is not None:
                 hdr[k] = h[k]
-    entries = []                                           # (ep, var, task, shard, off, len)
+    # Records are copied WHOLE (only `offset` is rewritten): rebuilding them from a
+    # fixed key set silently dropped task_key/src_len/n_frames on every merge.
+    entries = []                                           # (ep, var, shard, record)
     for si, m in enumerate(metas):
         for r in m["records"]:
-            entries.append((r["episode"], r["variant"], r["task_index"], si,
-                            r["offset"], r["length"]))
+            entries.append((int(r["episode"]), int(r.get("variant", 0)), si, r))
     entries.sort(key=lambda e: (e[0], e[1]))
     d_enc = int(hdr["d_enc"])
-    total = sum(e[5] for e in entries)
+    total = sum(int(e[3]["length"]) for e in entries)
     os.makedirs(out_dir, exist_ok=True)
     mm = np.memmap(os.path.join(out_dir, "tokens.mmap"), dtype=np.float16,
                    mode="w+", shape=(total, d_enc))
@@ -129,10 +198,10 @@ def merge_shards(out_dir: str, shard_dirs: list) -> tuple:
                           shape=(sum(r["length"] for r in m["records"]), d_enc))
                 for d, m in zip(shard_dirs, metas)]
     off, records = 0, []
-    for ep, var, ti, si, soff, length in entries:
+    for _, _, si, r in entries:
+        soff, length = int(r["offset"]), int(r["length"])
         mm[off:off + length] = shard_mm[si][soff:soff + length]
-        records.append({"episode": ep, "variant": var, "task_index": ti,
-                        "offset": off, "length": length})
+        records.append({**r, "offset": off})
         off += length
     mm.flush()
     del mm
@@ -146,40 +215,67 @@ def merge_shards(out_dir: str, shard_dirs: list) -> tuple:
     return len(records), total
 
 
-def _load_episodes(repo_id, revision, shard=0, num_shards=1,
-                   workers=8):  # pragma: no cover (GPU/dataset)
-    """Yield full episodes from lerobot/libero (LeRobotDataset 0.5.1) — ALL frames.
+def _load_episodes(repo_id, revision, shard=0, num_shards=1, workers=8,
+                   root=None, video_backend=None, episodes=None,
+                   keys=None):  # pragma: no cover (GPU/dataset)
+    """Yield full episodes from a lerobot dataset (LeRobotDataset 0.5.1) — ALL frames.
 
     Per-frame `ds[i]` access random-seeks into the episode videos and decodes one
     frame at a time — the actual bottleneck of a full-frame build. Frames are
     therefore streamed through a DataLoader with `workers` parallel decoders
-    (order-preserving), and sliced back into episodes here."""
+    (order-preserving), and sliced back into episodes here.
+
+    `root` reads a LOCAL dataset (the merged libero_all build) instead of the hub,
+    `episodes` restricts the build to those episode_index values, and `keys` stamps
+    each episode with the task_key its records carry."""
     from collections import deque
 
     from torch.utils.data import DataLoader, Subset
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    from src.data.libero import prefetch_all_data_parquets
+    from src.data.libero import DEFAULT_LIBERO_REPO, prefetch_all_data_parquets
 
-    prefetch_all_data_parquets(repo_id, revision)
-    ds = LeRobotDataset(repo_id, revision=revision)
+    if root is None and repo_id == DEFAULT_LIBERO_REPO:
+        # The broken meta file_index this works around is lerobot/libero's alone.
+        prefetch_all_data_parquets(repo_id, revision)
+    ds = LeRobotDataset(repo_id, root=root, revision=(None if root else revision),
+                        video_backend=video_backend)
     img_key = ds.meta.camera_keys[0]
     eps = ds.meta.episodes
 
     def _erow(i):
         return eps.iloc[i].to_dict() if hasattr(eps, "iloc") else eps[i]
 
+    want = None if episodes is None else {int(e) for e in episodes}
     all_eps, plan, acc = [], [], 0
     for ep in range(ds.meta.total_episodes):
         row = _erow(ep)
+        # `--episodes` and `--keys` address rows by episode_index; a meta table whose
+        # row order is not that index would silently encode the wrong episodes.
+        if row.get("episode_index") is not None and int(row["episode_index"]) != ep:
+            raise ValueError(f"meta/episodes row {ep} carries episode_index "
+                             f"{int(row['episode_index'])}: rows are not addressed "
+                             f"by episode_index in this dataset")
         if row.get("dataset_from_index") is not None:
             start = int(row["dataset_from_index"])
             length = int(row["dataset_to_index"]) - start
         else:
             start, length = acc, int(row["length"])
             acc += length
+        if want is not None and ep not in want:
+            continue
+        if keys is not None and ep not in keys:
+            raise KeyError(f"episode {ep} is missing from the episode_keys file; "
+                           f"rebuild it for this dataset (scripts/make_episode_keys.py)")
         all_eps.append((ep, start, length))
+    if want is not None and len(all_eps) != len(want):
+        missing = sorted(want - {e for e, _, _ in all_eps})
+        raise ValueError(f"{len(missing)} requested episodes are not in the dataset "
+                         f"(first: {missing[:5]})")
+    if not all_eps:
+        raise ValueError(f"nothing to encode: {ds.meta.total_episodes} episodes in "
+                         f"{repo_id}, 0 selected by --episodes")
 
     # Balance shards by FRAME COUNT, not by episode count: LIBERO episodes run
     # 75..505 frames, so round-robin `ep % num_shards` leaves one H100 grinding
@@ -232,7 +328,8 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1,
                     print(f"[shard {shard}] decoded {done}/{len(plan)} episodes",
                           flush=True)
                 yield {"frames": torch.stack(cur_frames), "instruction": cur_meta[0],
-                       "episode": cur_ep, "task_index": cur_meta[1]}
+                       "episode": cur_ep, "task_index": cur_meta[1],
+                       "task_key": None if keys is None else keys[cur_ep]}
                 cur_frames, cur_meta = [], None
                 if pending:
                     cur_ep, _, cur_need = pending.popleft()
@@ -242,8 +339,7 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1,
 
 def main(argv=None):  # pragma: no cover (GPU)
     p = argparse.ArgumentParser()
-    p.add_argument("--repo_id", default="lerobot/libero")
-    p.add_argument("--revision", default="v3.0")
+    add_dataset_args(p)
     p.add_argument("--encoder", default="dino")            # dino | vjepa2
     p.add_argument("--encoder_model", default=None)
     p.add_argument("--out", required=True)
@@ -275,7 +371,7 @@ def main(argv=None):  # pragma: no cover (GPU)
                         "decode — the decode pass is what a build actually spends.")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1,
-                   help=">1: encode episodes ep%%num_shards==shard into <out>.shard<i>")
+                   help=">1: split the episodes over <out>.shard<i> (frame-balanced)")
     p.add_argument("--merge_shards", type=int, default=0,
                    help="merge <out>.shard0..N-1 into <out> (no GPU) and exit")
     p.add_argument("--workers", type=int, default=8,
@@ -288,6 +384,7 @@ def main(argv=None):  # pragma: no cover (GPU)
         print(f"merged {args.merge_shards} shards -> {n} records ({total} tokens) at {args.out}")
         return
 
+    source = dataset_kwargs(args)          # before the encoder: fail fast on a typo
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dino_grid = DINO_SIDE if args.dino_patches else args.dino_grid
     fmt = encoder_format(args.encoder, args.vjepa_grid, dino_grid=dino_grid,
@@ -323,7 +420,7 @@ def main(argv=None):  # pragma: no cover (GPU)
 
     out_dir = (f"{args.out}.shard{args.shard}" if args.num_shards > 1 else args.out)
     episodes = _load_episodes(args.repo_id, args.revision, args.shard,
-                              args.num_shards, workers=args.workers)
+                              args.num_shards, workers=args.workers, **source)
     header = CacheHeader(
         encoder_id=args.encoder, format=fmt, d_enc=0, aug_set=aug_set, num_records=0,
         # For dino the encode window is a pure batch size — frames are embedded

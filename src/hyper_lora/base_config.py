@@ -23,6 +23,10 @@ _DENYLIST: frozenset[str] = frozenset({
     "optimizer_betas", "optimizer_eps", "optimizer_grad_clip_norm",
     "optimizer_lr", "optimizer_weight_decay",
     "scheduler_decay_lr", "scheduler_decay_steps", "scheduler_warmup_steps",
+    # Provenance of the BASE's own training run, not of the model we build: a
+    # finetuned base (Kesvill/smolvla_libero_90) carries pretrained_path=/tmp/local/
+    # base_io, and injecting it makes lerobot load a policy from that dead path.
+    "pretrained_path", "use_peft", "compile_model", "compile_mode",
 })
 
 

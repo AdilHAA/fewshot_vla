@@ -46,3 +46,22 @@ def stride_slice(tokens_per_frame: np.ndarray, every: int) -> np.ndarray:
     Selects the same frame indices `stride_indices` would — the scratch control thus
     conditions on exactly the frames the Qwen video cache encodes."""
     return tokens_per_frame[stride_indices(len(tokens_per_frame), every)]
+
+
+def pair_timestamps(src_len: int, every: int, fps: float) -> list[float]:
+    """One timestamp (seconds) per 49-token unit, i.e. per temporal patch.
+
+    The tower folds frames in pairs (temporal_patch_size=2), so `stride_indices`
+    returns an even count and unit i covers frames (idx[2i], idx[2i+1]). Qwen3.5's
+    prompt labels that unit with the MEAN of the two frame times — see
+    Qwen3VLProcessor._calculate_timestamps (transformers 5.7.0,
+    processing_qwen3_vl.py:257-268), which averages the timestamps inside each
+    temporal patch before emitting `<{t:.1f} seconds>`. Reproducing the average here
+    is what makes the cached tokens land in a prompt the trunk has actually seen —
+    in the processor's ORDER of operations (divide, then average): `{t:.1f}` rounds at
+    .x5 boundaries, where (a+b)/2/fps and (a/fps+b/fps)/2 differ by one ulp and print
+    a different label.
+    """
+    idx = stride_indices(src_len, every)
+    fps = float(fps)
+    return [(float(idx[i]) / fps + float(idx[i + 1]) / fps) / 2.0 for i in range(0, len(idx), 2)]

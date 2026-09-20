@@ -172,12 +172,17 @@ python scripts/summarize_matrix.py outputs/eval_matrix --per_task libero_90_eval
 Результат базы (SR %, 50 эп./задачу): 90-train 74.8 · 90-eval 1.9 · libero_10 0.2 ·
 goal/object/spatial 0.0 · Pro lan/object/swap 0.0, task 7.6 — таблица и разбор в `MODEL_CARD.md`.
 
-Гиперсеть на этой базе **пока не запускать**: резолв задачи по тексту инструкции и кеши демо
-(`build_xpair_cache.py`, `build_frame_bank.py`) рассчитаны на lerobot/libero; для LIBERO-90 нужен
-ключ задачи по `task_id` (74 текста на 90 задач) и пересборка кешей — это следующий шаг этапа.
-Ручки под него в `train.sh` уже есть: `BASE=`, `DATASET=`, `DATASET_ROOT=`, `VIDEO_BACKEND=pyav`,
-`EPISODES=` (список эпизодов из `train_episodes.json`), `LORA_TARGET=expert_mlp`.
+Гиперсеть на этой базе (план §8): HN учится на lerobot/libero + 50 held-out задачах LIBERO-90,
+ключ задачи — bddl-stem (`configs/task_registry.json`, `episode_keys.json` датасета, `task_key` в
+кешах, на eval стем приходит из env через `subtask`), LoRA r16/α32 только на MLP эксперта, тест —
+LIBERO-Pro на libero_10.
 
+```bash
+bash scripts/prepare_hn_data.sh                 # merge, реестр, ключи эпизодов, список train-эпизодов, кеши (8 карт)
+ARM=trunk   NPROC=8 bash scripts/hn_arms.sh     # Qwen3.5-0.8B: каждый 4-й кадр, родной видео-промпт, 16 обучаемых токенов
+ARM=scratch NPROC=8 bash scripts/hn_arms.sh     # скретч-трансформер над DINOv2 CLS всех кадров
+POLICIES="trunk=outputs/hn_trunk/checkpoints/last/pretrained_model" bash scripts/eval_all_8gpu.sh
+```
 Провенанс датасета (повторять не нужно): `scripts/prepare_nvidia_libero90.py` (NVIDIA no-op
 LIBERO-90 → камеры → гриппер 0/1→±1 → task_id по совпадению действий с yzembodied → списки
 эпизодов сплита → проверка ориентации кадров) и `scripts/harmonize_libero90.py` (fps/схема как у

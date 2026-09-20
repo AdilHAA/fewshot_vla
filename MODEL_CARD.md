@@ -92,10 +92,9 @@ python scripts/check_libero_merge.py --merge     # validate_all_metadata + merge
 на 1693), а `task_index` строится по тексту инструкции — эпизоды выбирайте по `episode_task_map.json`,
 не по тексту.
 
-**5. Гиперсеть на LIBERO-90** — пока не поддержана: резолв задачи по тексту и кеши демо в
-`src/traj_data` рассчитаны на lerobot/libero (74 уникальных текста на 90 задач ломают ключевание);
-это следующий шаг этапа.
-
+**5. Гиперсеть на LIBERO-90** — `bash scripts/prepare_hn_data.sh` (merge с lerobot/libero, ключи
+задач по bddl-stem, кеши демо), затем `ARM=trunk|scratch NPROC=8 bash scripts/hn_arms.sh`; протокол —
+план `docs/experiments/2026-08-30-plan-libero90-heldout.md` §8.
 ## Модель `smolvla_libero_90`
 
 | | |

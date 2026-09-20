@@ -13,7 +13,10 @@ control's strided dino CLS cache, so the trunk arm and its control see bit-ident
 frames.
 
   python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen35vl_e4 \
-      --every 4                       # shard with --shard/--num_shards as usual
+      --every 4 --legacy_keys         # shard with --shard/--num_shards as usual
+  python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen90_e4 \
+      --repo_id local/libero_all --root outputs/libero90/libero_all \
+      --video_backend pyav --keys outputs/libero90/libero_all/episode_keys.json
   python scripts/build_qwen35_video_cache.py --out outputs/xpair_cache/qwen35vl_e4 \
       --merge_shards 2
 """
@@ -28,15 +31,17 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.build_xpair_cache import _load_episodes
+from scripts.build_xpair_cache import (_load_episodes, _task_of, add_dataset_args,
+                                       dataset_kwargs)
 from src.traj_data.cache_io import CacheHeader, CacheWriter
 from src.traj_data.encoder import default_model_id  # noqa: F401 (reuse pattern)
 from src.traj_data.stride import stride_indices
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
-# Frames are resized to this square before the processor so the token count per frame
-# is pinned (14x14 patches -> 7x7 merged = 49 tokens/frame); without a pin the
-# processor's smart_resize picks its own resolution and the cache size drifts.
+# Frames are resized to this square before the processor so the token count is pinned
+# (14x14 patches/frame -> 7x7 merged = 49 tokens per FRAME PAIR, the tower's temporal
+# patch); without a pin the processor's smart_resize picks its own resolution and the
+# cache size drifts.
 FRAME_SIZE = 224
 
 
@@ -64,8 +69,7 @@ def encode_frames(model, processor, frames: torch.Tensor, every: int):
 
 def main(argv=None):  # pragma: no cover (GPU/weights)
     p = argparse.ArgumentParser()
-    p.add_argument("--repo_id", default="lerobot/libero")
-    p.add_argument("--revision", default="v3.0")
+    add_dataset_args(p)
     p.add_argument("--out", required=True)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--every", type=int, default=4,
@@ -86,6 +90,8 @@ def main(argv=None):  # pragma: no cover (GPU/weights)
               f"to {args.out}")
         return
 
+    source = dataset_kwargs(args)            # before the weights: fail fast on a typo
+
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,18 +102,22 @@ def main(argv=None):  # pragma: no cover (GPU/weights)
     processor = AutoProcessor.from_pretrained(args.model)
 
     episodes = _load_episodes(args.repo_id, args.revision, args.shard,
-                              args.num_shards, workers=args.workers)
+                              args.num_shards, workers=args.workers, **source)
     out_dir = (f"{args.out}.shard{args.shard}" if args.num_shards > 1 else args.out)
     d_enc = int(model.config.text_config.hidden_size)
     fmt = f"qwen35vl_every{args.every}"
     writer, task_texts, n = None, {}, 0
     for ep in episodes:
-        task_texts.setdefault(int(ep["task_index"]), ep["instruction"])
+        fields, tkey = _task_of(ep)
+        task_texts.setdefault(tkey, ep["instruction"])
         toks, used = encode_frames(model, processor, ep["frames"], args.every)
         if writer is None:
             writer = CacheWriter(out_dir, int(toks.shape[-1]))
+        # src_len (the UNstrided length) + the header stride are what let the trunk
+        # rebuild the encoded frame indices, and hence the prompt timestamps.
         writer.add(toks, {"episode": ep["episode"], "variant": 0,
-                          "task_index": ep["task_index"], "n_frames": used})
+                          "src_len": int(ep["frames"].shape[0]),
+                          "n_frames": used, **fields})
         n += 1
         if n % 100 == 0:
             print(f"[shard {args.shard}] encoded {n} episodes", flush=True)

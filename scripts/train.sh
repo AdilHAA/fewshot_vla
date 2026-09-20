@@ -20,16 +20,22 @@
 #   EXPERT     (0)                    1 = also unfreeze + train the action
 #                                     expert (HN modes only; checkpoint grows)
 #   RANK       (4)                    LoRA rank (HN generation / PEFT adapter)
-#   BATCH      (16 vision, 32 other)  train batch size
+#   ALPHA      (RANK*4)               LoRA alpha of the generated adapter (HN modes;
+#                                     `lora` mode scales through PEFT instead)
+#   BATCH      (16 vision, 32 other)  train batch size, PER PROCESS when NPROC>1
 #   WORKERS    (8)                    dataloader workers
+#   NPROC      (1)                    >1 = `accelerate launch --multi_gpu` over NPROC
+#                                     GPUs (same NCCL env as finetune_ours.sh)
+#   GPUS       ()                     CUDA_VISIBLE_DEVICES, e.g. "0,1,2,3" or "4"
 #   SAVE_FREQ  (25000)                checkpoint interval (steps)
 #   OUTPUT     (outputs/<mode>…)      output dir (must not pre-exist unless RESUME=1)
 #   PREC       (bf16)                 bf16 | no (fp32)
 #   DINO_ID    (facebook/dinov2-base) external vision encoder (vision mode)
 #   ENC        (dino)                traj clip encoder: dino | vjepa2
-#   XPAIR_CACHE (outputs/xpair_cache/$ENC)  traj-clip cache dir (traj mode; build
-#                                     it first with scripts/build_xpair_cache.py
-#                                     --encoder $ENC)
+#   XPAIR_CACHE (outputs/xpair_cache/$ENC; …/qwen35vl_e$TSTRIDE when TRUNK is set)
+#                                     traj-clip cache dir (traj mode; build it first
+#                                     with scripts/build_xpair_cache.py --encoder $ENC,
+#                                     or build_qwen35_video_cache.py for the trunk)
 #   KV         (0)                    1 = also inject LoRA at the VLM k/v routing
 #                                     site (traj mode)
 #   PAIR       (cross)               train pairing sugar -> hn_p_self:
@@ -72,6 +78,9 @@
 #                                     every episode; token count scales with length)
 #   TEXT       (1)                   trunk: 1 = include the instruction in the trunk
 #                                     input, 0 = video tokens only
+#   TNATIVE    (1)                   trunk: 1 = feed the trunk the prompt Qwen3.5 itself
+#                                     builds for a video (timestamp marks, vision spans,
+#                                     3-D rope); 0 = the legacy flat token run (_raw)
 #   BANK       (outputs/frame_bank.npz)  vision mode, PAIR=same|cross: first-frame
 #                                     bank path (build with the frame-bank script)
 #   VLM        (1)                   1 = also condition the HN on the VLM's own
@@ -82,6 +91,8 @@
 #                                     would see a random step on train and t=0 at
 #                                     eval. Historical default: ON in vision, absent
 #                                     in traj — hence the _vlm / _novlm suffixes.
+#                                     TRUNK forces it OFF: that arm reads the video
+#                                     cache and needs no frame bank.
 #   WANDB      (1)                    1 = enable wandb logging
 #   WANDB_PROJECT (hyper-lora)        wandb project name
 #   WANDB_OFFLINE (0)                 1 = log wandb locally without network/login
@@ -115,12 +126,14 @@ SEED="${SEED:-42}"
 AUG="${AUG:-0}"
 EXPERT="${EXPERT:-0}"
 RANK="${RANK:-4}"
+ALPHA="${ALPHA:-$((RANK * 4))}"
 WORKERS="${WORKERS:-8}"
+NPROC="${NPROC:-1}"
+GPUS="${GPUS:-}"
 SAVE_FREQ="${SAVE_FREQ:-25000}"
 PREC="${PREC:-bf16}"
 DINO_ID="${DINO_ID:-facebook/dinov2-base}"
 ENC="${ENC:-dino}"
-XPAIR_CACHE="${XPAIR_CACHE:-outputs/xpair_cache/$ENC}"
 KV="${KV:-0}"
 PAIR="${PAIR:-cross}"
 P_SELF="${P_SELF:-}"
@@ -141,6 +154,15 @@ DTOK="${DTOK:-all}"
 TRUNK="${TRUNK:-}"
 TSTRIDE="${TSTRIDE:-4}"
 TEXT="${TEXT:-1}"
+TNATIVE="${TNATIVE:-1}"
+# The trunk arm conditions on the qwen35vl VIDEO-token cache, not on the $ENC clip
+# cache — its default path follows TSTRIDE, which is what the cache was built with.
+if [ -n "$TRUNK" ]; then
+    DEFAULT_CACHE="outputs/xpair_cache/qwen35vl_e$TSTRIDE"
+else
+    DEFAULT_CACHE="outputs/xpair_cache/$ENC"
+fi
+XPAIR_CACHE="${XPAIR_CACHE:-$DEFAULT_CACHE}"
 BASE="${BASE:-HuggingFaceVLA/smolvla_libero}"
 DATASET="${DATASET:-lerobot/libero}"
 DATASET_ROOT="${DATASET_ROOT:-}"
@@ -152,6 +174,18 @@ LORA_TARGET="${LORA_TARGET:-vlm_mlp}"
 # byte-identical argv). Build the list for a task with scripts/pick_task.py.
 # NO quotes inside the value: draccus rejects '"[57]"' for a list[int] field.
 EPISODES="${EPISODES:-}"
+# EPISODES_FILE: the same list, read from a JSON file of ints (a dataset's
+# train_episodes.json / the HN train split). Mutually exclusive with EPISODES.
+EPISODES_FILE="${EPISODES_FILE:-}"
+if [ -n "$EPISODES_FILE" ]; then
+    if [ -n "$EPISODES" ]; then
+        echo "ERROR: set EPISODES or EPISODES_FILE, not both" >&2; exit 1
+    fi
+    if [ ! -f "$EPISODES_FILE" ]; then
+        echo "ERROR: EPISODES_FILE '$EPISODES_FILE' not found" >&2; exit 1
+    fi
+    EPISODES="$(python -c 'import json,sys; print(json.dumps(sorted(set(json.load(open(sys.argv[1])))), separators=(",", ":")))' "$EPISODES_FILE")"
+fi
 # SCHED_DECAY: the SmolVLA lr preset floors at scheduler_decay_lr (2.5e-6) after
 # scheduler_decay_steps=30k and does NOT scale with --steps, so steps 30k-100k of
 # every run so far trained at 2.5% of peak lr. Set this when EXTENDING a run
@@ -167,6 +201,7 @@ case "$TSEL"  in all|first)      ;; *) echo "ERROR: TSEL must be all|first, got 
 case "$TFILL" in ""|dup|zero)    ;; *) echo "ERROR: TFILL must be empty|dup|zero, got '$TFILL'" >&2; exit 1 ;; esac
 case "$TPOS"  in none|index|phase) ;; *) echo "ERROR: TPOS must be none|index|phase, got '$TPOS'" >&2; exit 1 ;; esac
 case "$DTOK"  in all|cls)        ;; *) echo "ERROR: DTOK must be all|cls, got '$DTOK'" >&2; exit 1 ;; esac
+case "$TNATIVE" in 0|1)          ;; *) echo "ERROR: TNATIVE must be 0|1, got '$TNATIVE'" >&2; exit 1 ;; esac
 case "$LORA_TARGET" in vlm_mlp|expert_mlp) ;; *) echo "ERROR: LORA_TARGET must be vlm_mlp|expert_mlp, got '$LORA_TARGET'" >&2; exit 1 ;; esac
 if [ "$LORA_TARGET" = "expert_mlp" ] && [ "$EXPERT" = "1" ]; then
     echo "ERROR: LORA_TARGET=expert_mlp requires EXPERT=0 — the expert stays frozen" >&2
@@ -184,6 +219,10 @@ if [ -z "$P_SELF" ]; then
 fi
 BANK="${BANK:-outputs/frame_bank.npz}"
 VLM="${VLM:-1}"
+if [ "$MODE" = "traj" ] && [ -n "$TRUNK" ] && [ "$VLM" != "0" ]; then
+    echo "==> TRUNK set: VLM stream off (the trunk reads the video cache; no frame bank needed)"
+    VLM=0
+fi
 [ "$KV" = "1" ] && KV_FLAG=true || KV_FLAG=false
 export ACCELERATE_MIXED_PRECISION="$PREC"
 [ "${WANDB:-1}" = "1" ] && WANDB_FLAG=true || WANDB_FLAG=false
@@ -204,6 +243,7 @@ case "$MODE" in
 esac
 # Ablation toggles get distinct default output dirs so runs don't collide.
 [ "$RANK" != "4" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_r${RANK}"
+[ "$ALPHA" != "$((RANK * 4))" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_a${ALPHA}"
 [ "$SEED" != "42" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_s${SEED}"
 [ "$AUG" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_aug"
 [ "$EXPERT" = "1" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_expert"
@@ -241,11 +281,12 @@ case "$MODE" in
             short="$(basename "$TRUNK" | tr 'A-Z' 'a-z')"
             DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_trunk_${short}_e${TSTRIDE}"
             [ "$TEXT" = "0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_notext"
+            [ "$TNATIVE" = "0" ] && DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_raw"
         fi
         # A different cache IS a different arm (TENC_MODEL/TCHUNK only *assert*
         # provenance; XPAIR_CACHE is what actually selects the data). Skipped when
         # the flags above already spell the cache name out.
-        if [ "$XPAIR_CACHE" != "outputs/xpair_cache/$ENC" ]; then
+        if [ "$XPAIR_CACHE" != "$DEFAULT_CACHE" ]; then
             CACHE_TAG="$(basename "$XPAIR_CACHE")"
             case "$DEFAULT_OUTPUT" in
                 *"$CACHE_TAG"*) : ;;
@@ -254,6 +295,17 @@ case "$MODE" in
         fi ;;
 esac
 OUTPUT="${OUTPUT:-$DEFAULT_OUTPUT}"
+
+# Launcher: NPROC=1 keeps the historical `python train_hyper_lora.py` argv verbatim;
+# NPROC>1 runs the same argv under accelerate DDP with finetune_ours.sh's env (NCCL
+# over SHM only — P2P/IB hang on this node), and $BATCH is then PER PROCESS.
+if [ "$NPROC" != "1" ]; then
+    export DATASETS_SOFT_LOCK=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1
+    LAUNCH=(accelerate launch --num_processes="$NPROC" --multi_gpu --mixed_precision="$PREC")
+else
+    LAUNCH=(python)
+fi
+[ -n "$GPUS" ] && export CUDA_VISIBLE_DEVICES="$GPUS"
 
 if [ "$RESUME" = "1" ]; then
     CONFIG="$OUTPUT/checkpoints/last/pretrained_model/train_config.json"
@@ -279,7 +331,7 @@ if [ "$RESUME" = "1" ]; then
     [ -n "$SCHED_DECAY" ] && RESUME_ARGS+=(--policy.scheduler_decay_steps="$SCHED_DECAY")
     echo "==> Resuming $OUTPUT from $(readlink -f "$OUTPUT/checkpoints/last") | save_freq=$SAVE_FREQ | steps=$STEPS (config: $CFG_STEPS)"
     # shellcheck disable=SC2068
-    exec python train_hyper_lora.py --config_path="$CONFIG" --resume=true --save_freq="$SAVE_FREQ" ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}
+    exec "${LAUNCH[@]}" train_hyper_lora.py --config_path="$CONFIG" --resume=true --save_freq="$SAVE_FREQ" ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}
 fi
 
 if [ -e "$OUTPUT" ]; then
@@ -308,7 +360,7 @@ case "$MODE" in
             --policy.hn_use_dino=true
             --policy.hn_dino_model_id="$DINO_ID"
             --policy.hn_dino_tokens="$DTOK"
-            --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
+            --policy.lora_rank="$RANK" --policy.lora_alpha="$ALPHA"
             --policy.train_action_expert="$EXPERT_FLAG"
         )
         [ "$PAIR" != "obs" ] && MODE_ARGS+=(
@@ -318,7 +370,7 @@ case "$MODE" in
     text)
         MODE_ARGS+=(
             --policy.type=hyper_lora_smolvla
-            --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
+            --policy.lora_rank="$RANK" --policy.lora_alpha="$ALPHA"
             --policy.train_action_expert="$EXPERT_FLAG"
         ) ;;
     lora)
@@ -369,7 +421,7 @@ case "$MODE" in
             --policy.hn_context_k="$K"
             --policy.hn_vjepa_grid="$VGRID"
             --policy.hn_inject_vlm_kv="$KV_FLAG"
-            --policy.lora_rank="$RANK" --policy.lora_alpha=$((RANK * 4))
+            --policy.lora_rank="$RANK" --policy.lora_alpha="$ALPHA"
             --policy.train_action_expert="$EXPERT_FLAG"
         )
         # Appended only when actually used, so the command line of every existing
@@ -394,6 +446,7 @@ case "$MODE" in
                 --policy.hn_trunk_model="$TRUNK"
                 --policy.hn_trunk_stride="$TSTRIDE"
                 --policy.hn_trunk_text="$([ "$TEXT" = "1" ] && echo true || echo false)"
+                --policy.hn_trunk_native="$([ "$TNATIVE" = "1" ] && echo true || echo false)"
             )
         fi
         : ;;   # the `:` keeps the branch's exit status 0 under `set -e`
@@ -406,9 +459,9 @@ if [ "$MODE" != "lora" ]; then
     [ "$LORA_TARGET" != "vlm_mlp" ] && MODE_ARGS+=(--policy.hn_lora_target="$LORA_TARGET")
 fi
 
-echo "==> Train | mode=$MODE | rank=$RANK | prec=$PREC | batch=$BATCH | seed=$SEED | aug=$AUG_FLAG | expert=$EXPERT_FLAG | wandb=$WANDB_FLAG"
+echo "==> Train | mode=$MODE | rank=$RANK | prec=$PREC | batch=$BATCH/proc x $NPROC | seed=$SEED | aug=$AUG_FLAG | expert=$EXPERT_FLAG | wandb=$WANDB_FLAG"
 echo "    output=$OUTPUT"
-python train_hyper_lora.py \
+"${LAUNCH[@]}" train_hyper_lora.py \
     "${MODE_ARGS[@]}" \
     --dataset.repo_id="$DATASET" \
     ${DATASET_ROOT:+--dataset.root=$DATASET_ROOT} \

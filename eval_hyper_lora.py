@@ -18,8 +18,25 @@ os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", "0")
 import src.hyper_lora  # noqa: E402,F401 — registers HyperLoRASmolVLAPolicy
 import src.hyper_lora_traj  # noqa: E402,F401 — registers TrajHyperLoRASmolVLAPolicy
 import src.libero_pro  # noqa: E402,F401 — registers LIBERO-Pro perturbed suites
-from lerobot.scripts.lerobot_eval import eval_main  # noqa: E402
+from lerobot.scripts import lerobot_eval  # noqa: E402
 
+_add_envs_task = lerobot_eval.add_envs_task
+
+
+def add_envs_task(env, observation):
+    """lerobot's helper only fills observation['task'] (the instruction). Two LIBERO
+    tasks in different scenes can share an instruction, so the hypernetwork resolves
+    its demo context by the bddl stem instead: LiberoEnv.task, passed on as 'subtask'
+    (a key lerobot's processor pipeline forwards to the policy batch)."""
+    observation = _add_envs_task(env, observation)
+    if hasattr(env.envs[0], "task"):
+        observation["subtask"] = list(env.call("task"))
+    return observation
+
+
+# rollout() imported the name INTO lerobot_eval, so the rebind must land there
+# (patching lerobot.envs.utils would be looked up by nobody).
+lerobot_eval.add_envs_task = add_envs_task
 
 if __name__ == "__main__":
-    eval_main()
+    lerobot_eval.eval_main()

@@ -11,9 +11,9 @@ header, so no encoder model is loaded at construction or during training:
   * TRAIN: `_inject_lora` reads the context demo chosen by the p_self selector
     (`hn_p_self`: prob of the imitated episode itself; 0.0 = one other same-task
     demo, the off-diagonal of the within-task cartesian product);
-  * EVAL: the base task is resolved (batch `task_index`, else the decoded instruction
-    matched against the cache `task_texts`) and its K cached demos are read
-    deterministically, then expanded across the vectorized env batch.
+  * EVAL: the task key (the LIBERO bddl stem `eval_hyper_lora.py` forwards as
+    `batch['subtask']`) selects that task's K cached demos deterministically, then
+    they are expanded across the vectorized env batch.
 
 The generated adapter is cached per episode via `HN_LORA_CACHE=episode` (parent knob), so
 the demo read + hypernetwork run happen once per rollout episode. The verified pure logic
@@ -34,13 +34,11 @@ from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TO
 
 from src.hyper_lora.dynamic_lora import DynamicLoRALinear
 from src.hyper_lora.modeling_hyper_lora_smolvla import HyperLoRASmolVLAPolicy
-from src.traj_data.xpair_select import (
-    pack_conditioning,
-    select_eval_conditioning,
-    select_train_conditioning,
-)
+from src.traj_data.stride import pair_timestamps
+from src.traj_data.xpair_select import pack_rows, select_eval_rows, select_train_rows
 
 from .configuration_traj_hyper_lora_smolvla import TrajHyperLoRASmolVLAConfig
+from .eval_keys import resolve_eval_key
 from .fusion_hypernetwork import FusionHyperNetwork
 
 logger = logging.getLogger(__name__)
@@ -100,6 +98,9 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
         tm = self.hypernet.target_modules
         dino_dim = (int(self.dino.config.hidden_size)
                     if getattr(self, "dino", None) is not None else 0)
+        # DDP: every rank must draw a DIFFERENT context for the same episode,
+        # otherwise the ranks of a step condition on one shared demo draw.
+        ctx_seed = int(config.hn_seed) + int(os.environ.get("RANK", 0))
         if trunk_model:
             from .trunk_qwen35 import TrunkHyperNetwork
             self.hypernet = TrunkHyperNetwork(
@@ -123,9 +124,10 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
                 trunk_dim=int(self._traj_cache.header["d_enc"]),
                 trunk_text=getattr(config, "hn_trunk_text", True),
                 trunk_grad_ckpt=getattr(config, "hn_trunk_grad_ckpt", True),
+                trunk_native=getattr(config, "hn_trunk_native", True),
             )
             self._freeze_base()
-            self._traj_gen = torch.Generator().manual_seed(int(config.hn_seed))
+            self._traj_gen = torch.Generator().manual_seed(ctx_seed)
             return
         self.hypernet = FusionHyperNetwork(
             text_embed_dim=self._vlm_text_hidden_size(),
@@ -156,7 +158,7 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
             traj_pos_std=getattr(config, "hn_traj_pos_std", 0.02),
         )
         self._freeze_base()
-        self._traj_gen = torch.Generator().manual_seed(int(config.hn_seed))
+        self._traj_gen = torch.Generator().manual_seed(ctx_seed)
 
     # --- backward-compatible site patching (unchanged from Stage 1) -------------------
     def _patch_mlp_layers(
@@ -225,16 +227,21 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
                 dino_embeds = self._dino_features(cond_batch)
 
         traj_embeds = traj_mask = traj_marks = traj_pos = traj_sub = None
+        trunk = bool(getattr(self.config, "hn_trunk_model", ""))
+        rows = keys = None
         if getattr(self.config, "hn_use_traj_clip", False):
-            with torch.no_grad():
-                (traj_embeds, traj_mask, traj_marks,
-                 traj_pos, traj_sub) = self._build_traj_conditioning(batch)
+            rows, keys = self._context_rows(batch)
+            if not trunk:
+                dev = self._hypernet_device()
+                with torch.no_grad():
+                    (traj_embeds, traj_mask, traj_marks, traj_pos, traj_sub) = (
+                        x.to(dev) for x in pack_rows(self._traj_cache, rows))
 
-        if getattr(self.config, "hn_trunk_model", ""):
+        if trunk:
             # The trunk eats cached VIDEO tokens + the raw instruction string; the
             # SmolVLA text embeds / marks / pos built above are unused here.
-            texts = self._trunk_texts(batch)
-            weights = self.hypernet.forward_trunk(traj_embeds, traj_mask, texts)
+            weights = self.hypernet.forward_trunk(self._trunk_clips(rows),
+                                                  self._trunk_texts(keys))
         else:
             weights = self.hypernet(
                 text_embeds, lang_masks, vlm_vision_embeds, dino_embeds,
@@ -250,74 +257,64 @@ class TrajHyperLoRASmolVLAPolicy(HyperLoRASmolVLAPolicy):
     def _hypernet_device(self) -> torch.device:
         return next(self.hypernet.parameters()).device
 
-    def _build_traj_conditioning(self, batch: Dict[str, Tensor]):
-        dev = self._hypernet_device()
-        if self.training:
-            ep, t = batch["episode_index"], batch["task_index"]
-            ep = ep.tolist() if hasattr(ep, "tolist") else list(ep)
-            t = t.tolist() if hasattr(t, "tolist") else list(t)
-            packed = select_train_conditioning(
-                self._traj_cache, ep, t, self.config.hn_p_self,
-                self.config.hn_context_k, self._traj_gen)
-            return tuple(x.to(dev) for x in packed)
-        # EVAL: every env in a rollout batch runs the same suite task -> one lookup,
-        # deterministic demo pick, expanded across the env batch. Context size equals
-        # hn_context_k for every arm — the train/eval format always matches.
-        task_index = self._resolve_eval_task(batch)
-        demos = select_eval_conditioning(
-            self._traj_cache, task_index, self.config.hn_context_k, self.config.hn_seed)
-        bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
-        packed = pack_conditioning([demos] * bsz,
-                                   int(self._traj_cache.header.get("tokens_per_unit", 1)))
-        logger.warning("[TRAJ] task=%d demos=%d tokens=%d",
-                       task_index, len(demos), packed[0].shape[1])
-        return tuple(x.to(dev) for x in packed)
+    def _context_rows(self, batch: Dict[str, Tensor]) -> tuple[list, list]:
+        """Cache rows + task key per batch sample — one selection for both arms.
 
-    def _trunk_texts(self, batch: Dict[str, Tensor]) -> list[str]:
-        """Instruction STRING per sample (the trunk has its own tokenizer)."""
+        TRAIN: the episode's own key (task_index is not a task identity on the merged
+        dataset). EVAL: every env of a rollout batch runs the same suite task, so one
+        key lookup + one deterministic demo pick, expanded across the env batch;
+        context size is hn_context_k on both sides, so the formats always match."""
         if self.training:
-            tis = batch["task_index"]
-            tis = tis.tolist() if hasattr(tis, "tolist") else list(tis)
-        else:
-            tis = [self._resolve_eval_task(batch)] * batch[OBS_LANGUAGE_TOKENS].shape[0]
+            eps = batch["episode_index"]
+            eps = [int(e) for e in (eps.tolist() if hasattr(eps, "tolist") else eps)]
+            rows = select_train_rows(self._traj_cache, eps, self.config.hn_p_self,
+                                     self.config.hn_context_k, self._traj_gen)
+            return rows, [self._traj_cache.key_of_episode(e) for e in eps]
+        key = self._eval_key(batch)
+        sel = select_eval_rows(self._traj_cache, key, self.config.hn_context_k,
+                               self.config.hn_seed)
+        bsz = batch[OBS_LANGUAGE_TOKENS].shape[0]
+        logger.warning("[TRAJ] key=%s demos=%d", key, len(sel))
+        return [sel] * bsz, [key] * bsz
+
+    def _trunk_clips(self, rows: list) -> list:
+        """Per sample, per demo: (cached video tokens, one timestamp per 49-token
+        unit). The native trunk rebuilds from them the '<t seconds>'-marked video
+        prompt Qwen3.5 sees in a chat, so the timestamps must be the strided pairs'
+        own; the raw layout carries no timestamps at all."""
+        cache = self._traj_cache
+        native = getattr(self.config, "hn_trunk_native", True)
+        every = int(self.config.hn_trunk_stride)
+        fps = float(getattr(self.config, "hn_trunk_fps", 10.0))
+
+        def stamps(r):
+            if not native:
+                return []
+            n = int(cache.records[r].get("src_len", 0))
+            if n <= 0:
+                raise ValueError(
+                    f"cache record for episode {cache.records[r]['episode']} has no "
+                    "src_len (built before task keys): the native trunk prompt needs the "
+                    "source frame count — rebuild the cache with the current "
+                    "build_qwen35_video_cache.py, or set hn_trunk_native=false")
+            return pair_timestamps(n, every, fps)
+
+        return [[(cache.read_row(r), stamps(r)) for r in sample] for sample in rows]
+
+    def _trunk_texts(self, keys: list) -> list[str]:
+        """Instruction STRING per sample (the trunk has its own tokenizer)."""
         texts = getattr(self._traj_cache, "task_texts", None) or {}
-        # task_texts keys are strings after the json round-trip
-        out = [texts.get(str(t), "") for t in tis]
+        out = [texts.get(k, "") for k in keys]
         if any(not x for x in out):
-            logger.warning("[TRUNK] empty instruction for tasks %s", tis)
+            logger.warning("[TRUNK] empty instruction for tasks %s", keys)
         return out
 
-    def _resolve_eval_task(self, batch: Dict[str, Tensor]) -> int:
-        """Base-task lookup: batch task_index when present, else the instruction
-        (raw string key, or decoded tokens) matched against the cache's task_texts."""
-        v = batch.get("task_index") if isinstance(batch, dict) else None
-        if v is not None:
-            return int(v.flatten()[0]) if hasattr(v, "flatten") else int(v)
-        # Raw instruction string — the env usually exposes it under "task".
-        text = ""
-        for key in ("task", "instruction", "language_instruction", "prompt"):
-            t = batch.get(key) if isinstance(batch, dict) else None
-            if isinstance(t, (list, tuple)) and t:
-                t = t[0]
-            if isinstance(t, str) and t:
-                text = t
-                break
-        # Fall back to decoding the tokenized instruction with a lazily-built tokenizer.
-        if not text and isinstance(batch, dict) and OBS_LANGUAGE_TOKENS in batch:
-            text = self._decode_instruction(batch[OBS_LANGUAGE_TOKENS][0])
-        ti = self._traj_cache.resolve_task(text)
-        if ti is None:
-            # Novel-instruction suites (e.g. the _task axis) legitimately miss the
-            # cutoff — condition on the nearest known task instead of crashing.
-            ti = self._traj_cache.nearest_task(text)
-            if ti is not None:
-                logger.warning("[TRAJ] instruction %r matched no cached task; "
-                               "falling back to nearest task %d", text, ti)
-        if ti is None:
-            keys = sorted(batch.keys()) if isinstance(batch, dict) else type(batch).__name__
-            raise RuntimeError(f"cannot resolve eval task; instruction={text!r}, "
-                               f"batch keys={keys}; pass task_index or extend task_texts")
-        return ti
+    def _eval_key(self, batch: Dict[str, Tensor]) -> str:
+        def _decode() -> str:
+            toks = batch.get(OBS_LANGUAGE_TOKENS) if isinstance(batch, dict) else None
+            return self._decode_instruction(toks[0]) if toks is not None else ""
+
+        return resolve_eval_key(batch, self._traj_cache, decode_fn=_decode)
 
     def _decode_instruction(self, token_ids) -> str:
         """Decode OBS_LANGUAGE_TOKENS via a tokenizer loaded from the VLM (cached).

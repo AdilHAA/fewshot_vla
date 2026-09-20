@@ -1,11 +1,13 @@
 """Task -> episode list + stats, for the single-task overfit arm.
 
 Reads the embedding cache's index.json — every record already carries
-{episode, variant, task_index} and the header says how many tokens one frame is,
-so task tables and per-task frame counts come free, no dataset access needed.
+{episode, variant, task_key} and the header says how many tokens one frame is, so
+task tables and per-task frame counts come free, no dataset access needed.
+Pre-registry caches carry an int `task_index` instead of the bddl stem; both load,
+and the argument is whatever the table prints.
 
-  python scripts/pick_task.py outputs/xpair_cache/dino            # list all tasks
-  python scripts/pick_task.py outputs/xpair_cache/dino 7          # task 7 detail
+  python scripts/pick_task.py outputs/xpair_cache/dino          # list all tasks
+  python scripts/pick_task.py outputs/xpair_cache/dino KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet
   python scripts/pick_task.py outputs/xpair_cache/dino 7 --shell  # ready EPISODES=
 """
 from __future__ import annotations
@@ -16,9 +18,15 @@ import os
 import sys
 
 
+def record_task(r: dict):
+    """Task identity of a record: the bddl stem, or a legacy int task_index."""
+    k = r.get("task_key")
+    return k if k is not None else int(r["task_index"])
+
+
 def task_table(records: list, header: dict) -> dict:
-    """{task_index: {"episodes": [...], "frames": n, "instruction": str}} for
-    ORIGINAL recordings only (variant==0), matching the conditioning pool."""
+    """{task: {"episodes": [...], "frames": n}} for ORIGINAL recordings only
+    (variant==0), matching the conditioning pool."""
     # tokens -> frames: dino 'cls' keeps 1 token per frame; vjepa tubelets cover
     # 2 frames and grid² tokens each. Derive from the format tag.
     fmt = header.get("format", "cls")
@@ -32,8 +40,7 @@ def task_table(records: list, header: dict) -> dict:
     for r in records:
         if r.get("variant", 0) != 0:
             continue
-        t = table.setdefault(int(r["task_index"]),
-                             {"episodes": [], "frames": 0.0})
+        t = table.setdefault(record_task(r), {"episodes": [], "frames": 0.0})
         t["episodes"].append(int(r["episode"]))
         t["frames"] += r["length"] / per_frame
     return table
@@ -42,7 +49,7 @@ def task_table(records: list, header: dict) -> dict:
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("cache", help="cache dir with index.json")
-    p.add_argument("task", nargs="?", type=int, help="task_index to detail")
+    p.add_argument("task", nargs="?", help="task_key (bddl stem) or legacy task_index")
     p.add_argument("--shell", action="store_true",
                    help="print only the ready-to-paste EPISODES= line")
     args = p.parse_args(argv)
@@ -50,29 +57,33 @@ def main(argv=None):
     with open(os.path.join(args.cache, "index.json")) as fh:
         meta = json.load(fh)
     header, records = meta["header"], meta["records"]
-    texts = {int(k): v for k, v in meta.get("task_texts", {}).items()}
+    texts = meta.get("task_texts", {})                     # str keys after json
     table = task_table(records, header)
 
     if args.task is None:
-        print(f"{'task':>4} {'eps':>4} {'frames':>7} {'med_len':>8}  instruction")
+        w = max([len(str(t)) for t in table] + [4])
+        print(f"{'task':<{w}} {'eps':>4} {'frames':>7}  instruction")
         for t in sorted(table):
             e = table[t]
-            print(f"{t:>4} {len(e['episodes']):>4} {int(e['frames']):>7} "
-                  f"{'':>8}  {texts.get(t, '?')[:60]}")
+            print(f"{str(t):<{w}} {len(e['episodes']):>4} {int(e['frames']):>7}  "
+                  f"{texts.get(str(t), '?')[:60]}")
         print("\ndetail + episode list: python scripts/pick_task.py "
-              f"{args.cache} <task_index>")
+              f"{args.cache} <task>")
         return
 
-    if args.task not in table:
+    task = args.task
+    if task not in table and task.isdigit() and int(task) in table:
+        task = int(task)                                   # legacy task_index cache
+    if task not in table:
         sys.exit(ftask_err(table, args.task))
-    e = table[args.task]
+    e = table[task]
     eps = sorted(e["episodes"])
     lengths = sorted(r["length"] for r in records
-                     if r.get("variant", 0) == 0 and r["task_index"] == args.task)
+                     if r.get("variant", 0) == 0 and record_task(r) == task)
     if args.shell:
         print("EPISODES=\"[" + ",".join(map(str, eps)) + "]\"")
         return
-    print(f"task {args.task}: {texts.get(args.task, '?')}")
+    print(f"task {task}: {texts.get(str(task), '?')}")
     print(f"  episodes: {len(eps)}, frames: {int(e['frames'])}, "
           f"record lengths min/med/max: {lengths[0]}/{lengths[len(lengths)//2]}/{lengths[-1]}")
     print(f"  ~{e['frames']/32:.0f} steps/epoch at BATCH=32 "
@@ -83,8 +94,9 @@ def main(argv=None):
 
 
 def ftask_err(table, task):
-    return (f"task {task} not in cache (have {sorted(table)[:5]}... "
-            f"{sorted(table)[-1]}, {len(table)} tasks)")
+    keys = sorted(map(str, table))
+    return (f"task {task!r} not in cache (have {keys[:3]}... {keys[-1]}, "
+            f"{len(table)} tasks)")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@
 #                    VLM=1 is on, because the VLM stream's train frame must be a
 #                    t=0 frame (matching eval), not the current step's.
 #   KEEP_SHARDS (0)    1 = keep the per-shard dirs after a successful merge
+#   SRC       (--legacy_keys)  dataset source flags passed to every build
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -44,6 +45,12 @@ PASS="${PASS:-all}"
 KEEP_SHARDS="${KEEP_SHARDS:-0}"
 BANK="${BANK:-outputs/frame_bank.npz}"
 BUILD=scripts/build_xpair_cache.py
+# The builder refuses to guess a task identity. These three passes read
+# lerobot/libero, the UNmerged dataset where task_index IS the task, so --legacy_keys
+# reproduces the existing caches byte-for-byte. A merged-dataset build overrides it:
+#   SRC="--root outputs/libero90/libero_all --video_backend pyav \
+#        --keys outputs/libero90/libero_all/episode_keys.json"
+read -r -a SRC_ARGS <<< "${SRC:---legacy_keys}"
 
 # run_pass <primary_out> <extra build args...>
 # Fans the shards across GPUs, waits, merges, then verifies the merged record count.
@@ -64,7 +71,8 @@ run_pass() {
     local pids=() i
     for ((i = 0; i < GPUS; i++)); do
         CUDA_VISIBLE_DEVICES="$i" python "$BUILD" --out "$out" \
-            --shard "$i" --num_shards "$GPUS" --workers "$WORKERS" "$@" &
+            --shard "$i" --num_shards "$GPUS" --workers "$WORKERS" \
+            "${SRC_ARGS[@]}" "$@" &
         pids+=($!)
     done
     local rc=0

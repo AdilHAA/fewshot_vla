@@ -73,6 +73,10 @@ class TrajHyperLoRASmolVLAConfig(HyperLoRASmolVLAConfig):
     hn_trunk_text: bool = True       # include the instruction in the trunk input
     hn_trunk_grad_ckpt: bool = True  # required: activations for the layer tokens
     hn_trunk_stride: int = 4         # keep every k-th frame (fixed interval)
+    # The trunk input is the chat prompt Qwen3.5 itself builds for a video: timestamp
+    # marks, vision spans, 3-D rope. False = the legacy flat [video|text|queries] run.
+    hn_trunk_native: bool = True
+    hn_trunk_fps: float = 10.0       # dataset fps -> the '<t seconds>' mark of each pair
 
     # --- HN fusion extras (neutral => FusionHyperNetwork fast-path == parent) ---------
     hn_stream_type_emb: bool = False

@@ -41,13 +41,14 @@ class CacheHeader:
 # and `aug_set` are here (not just in the policy check) because merging shards that
 # disagree writes irrecoverable garbage into one mmap.
 SHARD_KEYS = ("encoder_id", "format", "d_enc", "aug_set", "time_select",
-              "n_frames", "fill", "chunk", "encoder_model", "tokens_per_unit")
+              "n_frames", "fill", "chunk", "encoder_model", "tokens_per_unit",
+              "stride")
 
 # Values the pre-2026-08-02 builders implicitly had, used to read old caches and to
 # compare an old shard with a freshly rebuilt one. `chunk`/`encoder_model` are NOT
 # here: they are genuinely unknown for those caches, and inventing a value would
 # turn "unrecorded" into a false provenance claim.
-HEADER_DEFAULTS = {"time_select": "all", "n_frames": 0, "fill": ""}
+HEADER_DEFAULTS = {"time_select": "all", "n_frames": 0, "fill": "", "stride": 0}
 
 
 class CacheWriter:
@@ -92,8 +93,8 @@ class CacheWriter:
 def write_cache(out_dir: str, token_seqs: list, records: list[dict],
                 header: CacheHeader, task_texts: dict) -> None:
     """token_seqs[i] is a (L_i, d_enc) fp16 array for records[i] ({episode, variant,
-    task_index}); offset/length are computed here. task_texts maps task_index -> the
-    task instruction (eval-time text fallback)."""
+    task_key, src_len}); offset/length are computed here. task_texts maps task_key ->
+    the task instruction (the trunk arm tokenizes it; eval-time text fallback)."""
     os.makedirs(out_dir, exist_ok=True)
     assert len(token_seqs) == len(records) == header.num_records
     total = sum(int(s.shape[0]) for s in token_seqs)

@@ -23,7 +23,8 @@ export BASE="${BASE:-Kesvill/smolvla_libero_90}"
 export DATASET=local/libero_all DATASET_ROOT=outputs/libero90/libero_all VIDEO_BACKEND=pyav
 export EPISODES_FILE="${EPISODES_FILE:-outputs/libero90/hn_train_episodes.json}"
 export NPROC="${NPROC:-4}" BATCH="${BATCH:-8}" WORKERS="${WORKERS:-8}"
-export STEPS="${STEPS:-100000}" SCHED_DECAY="${SCHED_DECAY:-$STEPS}" SAVE_FREQ="${SAVE_FREQ:-10000}"
+export STEPS="${STEPS:-100000}" SAVE_FREQ="${SAVE_FREQ:-10000}"
+export SCHED_DECAY="${SCHED_DECAY:-$STEPS}"     # cosine over the whole run, not lerobot's 30k
 export TB="${TB:-1}" WANDB="${WANDB:-0}"
 export OUTPUT="${OUTPUT:-outputs/hn_$ARM}"
 case "$ARM" in

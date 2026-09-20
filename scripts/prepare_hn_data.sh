@@ -86,7 +86,9 @@ build() {
     done
     wait
     python "$@" --out "$out" --merge_shards "$N"
-    rm -rf "$out".shard*
+    # NFS keeps just-closed files as .nfs* placeholders for a moment: retry, never abort
+    rm -rf "$out".shard* 2>/dev/null || { sleep 10; rm -rf "$out".shard* 2>/dev/null; } \
+        || echo "    leftover shard dirs $out.shard* — remove them later"
 }
 
 QWEN=outputs/xpair_cache/hn_qwen35vl_e$EVERY

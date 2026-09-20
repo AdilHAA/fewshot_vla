@@ -40,8 +40,20 @@ mkdir -p "$LOGS"
 [ -f "$K90/eval_episodes.json" ] || { echo "ERROR: $K90 missing (hf download Kesvill/libero_90_lerobot_v3 --repo-type dataset --local-dir $K90)" >&2; exit 1; }
 
 echo "==> 1/6 merged root $ROOT"
-# meta/info.json is written last by lerobot's merge: its absence = an aborted merge
-[ -f "$ROOT/meta/info.json" ] || { rm -rf "$ROOT"; python scripts/check_libero_merge.py --merge --out "$ROOT"; }
+# lerobot's merge writes meta/info.json first and fills in the totals last, so a
+# complete root is one whose totals match; anything else is an aborted merge.
+merged_ok() {
+    python -c '
+import glob, json, sys
+r = sys.argv[1]
+try:
+    info = json.load(open(f"{r}/meta/info.json"))
+except FileNotFoundError:
+    sys.exit(1)
+sys.exit(0 if info.get("total_episodes") == 5614 and glob.glob(f"{r}/meta/episodes/*/*.parquet") else 1)
+' "$ROOT"
+}
+merged_ok || { rm -rf "$ROOT"; python scripts/check_libero_merge.py --merge --out "$ROOT"; }
 
 echo "==> 2/6 task registry check (LIBERO task order)"
 python scripts/make_task_registry.py --check

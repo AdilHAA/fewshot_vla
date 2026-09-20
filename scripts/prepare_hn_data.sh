@@ -40,7 +40,8 @@ mkdir -p "$LOGS"
 [ -f "$K90/eval_episodes.json" ] || { echo "ERROR: $K90 missing (hf download Kesvill/libero_90_lerobot_v3 --repo-type dataset --local-dir $K90)" >&2; exit 1; }
 
 echo "==> 1/6 merged root $ROOT"
-[ -d "$ROOT" ] || python scripts/check_libero_merge.py --merge --out "$ROOT"
+# meta/info.json is written last by lerobot's merge: its absence = an aborted merge
+[ -f "$ROOT/meta/info.json" ] || { rm -rf "$ROOT"; python scripts/check_libero_merge.py --merge --out "$ROOT"; }
 
 echo "==> 2/6 task registry check (LIBERO task order)"
 python scripts/make_task_registry.py --check

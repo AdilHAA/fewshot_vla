@@ -7,7 +7,7 @@
 #   outputs/libero90/hn_train_episodes.json    1693 lerobot/libero + 2188 held-out eps
 #   outputs/xpair_cache/hn_qwen35vl_e$EVERY    trunk arm cache (every EVERY-th frame)
 #   outputs/xpair_cache/hn_dino                scratch arm cache (DINOv2 CLS, all frames)
-# The caches cover ALL 5614 episodes / 130 tasks (the trainer restricts itself to
+# The caches cover ALL 5614 episodes / 129 tasks (the trainer restricts itself to
 # hn_train_episodes.json): eval needs a demo of every task it runs, including the
 # 39 90-train tasks of the "HN does no harm" control row. The hn_ prefix keeps them
 # apart from the lerobot/libero-only caches of earlier stages (same header, 40 tasks).
@@ -101,12 +101,15 @@ echo "==> 6/6 scratch cache $DINO"
     scripts/build_xpair_cache.py --encoder dino --encoder_model facebook/dinov2-base --encode_batch 256
 
 python - "$QWEN" "$DINO" <<'PY'
-import sys
+import json, sys
 from src.traj_data.traj_cache import TrajCache
+registry = {r["key"] for r in json.load(open("configs/task_registry.json"))["tasks"]}
+# LIBERO-90 task 51 has no episodes after the no-op filter (see the model card)
+absent = {"LIVING_ROOM_SCENE2_pick_up_the_butter_and_put_it_in_the_basket"}
 for d in sys.argv[1:]:
     c = TrajCache(d)
-    n_tasks, n_eps = len(c.task_keys()), len({r["episode"] for r in c.records})
-    print(f"{d}: episodes={n_eps} tasks={n_tasks} d_enc={c.header['d_enc']} "
+    keys, n_eps = set(c.task_keys()), len({r["episode"] for r in c.records})
+    print(f"{d}: episodes={n_eps} tasks={len(keys)} d_enc={c.header['d_enc']} "
           f"format={c.header['format']} stride={c.header.get('stride')}")
-    assert n_tasks == 130 and n_eps == 5614, (d, n_tasks, n_eps)
+    assert n_eps == 5614 and registry - keys == absent, (d, n_eps, sorted(registry - keys))
 PY

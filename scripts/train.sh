@@ -27,6 +27,8 @@
 #   NPROC      (1)                    >1 = `accelerate launch --multi_gpu` over NPROC
 #                                     GPUs (same NCCL env as finetune_ours.sh)
 #   GPUS       ()                     CUDA_VISIBLE_DEVICES, e.g. "0,1,2,3" or "4"
+#   PORT       (29500)                accelerate main_process_port (NPROC>1); give two
+#                                     concurrent DDP runs different ports
 #   SAVE_FREQ  (25000)                checkpoint interval (steps)
 #   OUTPUT     (outputs/<mode>…)      output dir (must not pre-exist unless RESUME=1)
 #   PREC       (bf16)                 bf16 | no (fp32)
@@ -300,8 +302,12 @@ OUTPUT="${OUTPUT:-$DEFAULT_OUTPUT}"
 # NPROC>1 runs the same argv under accelerate DDP with finetune_ours.sh's env (NCCL
 # over SHM only — P2P/IB hang on this node), and $BATCH is then PER PROCESS.
 if [ "$NPROC" != "1" ]; then
-    export DATASETS_SOFT_LOCK=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1
-    LAUNCH=(accelerate launch --num_processes="$NPROC" --multi_gpu --mixed_precision="$PREC")
+    # P2P/IB off by default (they hung on the 8xA100 node); NCCL_P2P_DISABLE=0 to
+    # let an NVLink node use it. PORT separates two DDP runs on one node.
+    export DATASETS_SOFT_LOCK=1
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}" NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+    LAUNCH=(accelerate launch --num_processes="$NPROC" --multi_gpu --mixed_precision="$PREC"
+            --main_process_port="${PORT:-29500}")
 else
     LAUNCH=(python)
 fi

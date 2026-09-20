@@ -5,9 +5,12 @@
 # A thin layer over scripts/train.sh: it only fixes the stage's knobs and prints them;
 # every other train.sh variable passes through (STEPS, BATCH, SEED, RESUME, ...).
 #
-#   ARM=trunk   NPROC=8 bash scripts/hn_arms.sh   # Qwen3.5-0.8B over every 4th frame, native video prompt
-#   ARM=scratch NPROC=8 bash scripts/hn_arms.sh   # 2-block transformer over DINOv2 CLS of all frames
-#   ARM=trunk STEPS=300 OUTPUT=outputs/probe_trunk NPROC=1 bash scripts/hn_arms.sh   # smoke
+#   ARM=trunk   bash scripts/hn_arms.sh           # Qwen3.5-0.8B over every 4th frame, native video prompt
+#   ARM=scratch bash scripts/hn_arms.sh           # 2-block transformer over DINOv2 CLS of all frames
+#   ARM=trunk STEPS=300 OUTPUT=outputs/probe_trunk NPROC=1 GPUS=0 bash scripts/hn_arms.sh   # smoke
+#
+# Defaults size the run for a 4-GPU node: NPROC=4 x BATCH=8 = the global batch 32 of
+# every HN arm so far. Two arms side by side: GPUS=0,1 NPROC=2 BATCH=16 PORT=29501.
 #
 # Data: bash scripts/prepare_hn_data.sh first (caches, episode keys, train list).
 set -euo pipefail
@@ -19,7 +22,7 @@ export RANK="${RANK:-16}" ALPHA="${ALPHA:-32}"
 export BASE="${BASE:-Kesvill/smolvla_libero_90}"
 export DATASET=local/libero_all DATASET_ROOT=outputs/libero90/libero_all VIDEO_BACKEND=pyav
 export EPISODES_FILE="${EPISODES_FILE:-outputs/libero90/hn_train_episodes.json}"
-export NPROC="${NPROC:-8}" BATCH="${BATCH:-4}" WORKERS="${WORKERS:-8}"
+export NPROC="${NPROC:-4}" BATCH="${BATCH:-8}" WORKERS="${WORKERS:-8}"
 export STEPS="${STEPS:-100000}" SCHED_DECAY="${SCHED_DECAY:-$STEPS}" SAVE_FREQ="${SAVE_FREQ:-10000}"
 export TB="${TB:-1}" WANDB="${WANDB:-0}"
 export OUTPUT="${OUTPUT:-outputs/hn_$ARM}"

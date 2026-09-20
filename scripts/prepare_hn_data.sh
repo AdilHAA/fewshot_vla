@@ -13,10 +13,10 @@
 # apart from the lerobot/libero-only caches of earlier stages (same header, 40 tasks).
 #
 #   bash scripts/prepare_hn_data.sh
-#   GPUS=0,1,2,3 WORKERS=8 bash scripts/prepare_hn_data.sh
+#   GPUS=0,1 WORKERS=8 bash scripts/prepare_hn_data.sh
 #
 # Env vars:
-#   GPUS     (0,1,2,3,4,5,6,7)  cards to shard the cache builds over
+#   GPUS     (0,1,2,3)          cards to shard the cache builds over
 #   WORKERS  (12)               video-decode workers per shard
 #   EVERY    (4)                trunk frame stride (= TSTRIDE at train time)
 #   K90      (outputs/libero90/libero_90_lerobot_v3)  Kesvill root (episode_task_map,
@@ -26,7 +26,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck disable=SC1091
 source venv/bin/activate
 
-GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
+GPUS="${GPUS:-0,1,2,3}"
 WORKERS="${WORKERS:-12}"
 EVERY="${EVERY:-4}"
 K90="${K90:-outputs/libero90/libero_90_lerobot_v3}"

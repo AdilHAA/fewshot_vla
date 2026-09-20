@@ -215,22 +215,98 @@ def merge_shards(out_dir: str, shard_dirs: list) -> tuple:
     return len(records), total
 
 
+class _FileStream(torch.utils.data.IterableDataset):
+    """Decode whole video FILES sequentially, one worker per file, and yield the
+    planned episodes of each as (episode, frames uint8 (T,H,W,3)).
+
+    lerobot's per-frame reader opens the file and decodes from the previous keyframe
+    for every frame; on a merged dataset whose mp4s hold hundreds of episodes that is
+    a few frames per second. A file decoded once, front to back, is thousands."""
+
+    def __init__(self, files, fps):
+        self.files, self.fps = files, float(fps)
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        wid, nw = (info.id, info.num_workers) if info else (0, 1)
+        for i, (path, spans) in enumerate(self.files):
+            if i % nw == wid:
+                yield from _decode_spans(path, spans, self.fps)
+
+
+def _decode_spans(path, spans, fps):
+    """spans: [(episode, from_ts, to_ts, length)] of one file, any order. Runs of
+    adjacent episodes are decoded in one pass; a gap (episodes of another shard, or
+    not in --episodes) is skipped with a keyframe seek."""
+    import av
+
+    tol = 0.5 / fps
+    spans = sorted(spans, key=lambda s: s[1])
+    runs = []
+    for sp in spans:
+        if runs and sp[1] - runs[-1][-1][2] <= 2.0:
+            runs[-1].append(sp)
+        else:
+            runs.append([sp])
+
+    def emit(span, frames):
+        ep, from_ts, to_ts, length = span
+        if len(frames) != length:
+            raise RuntimeError(f"episode {ep}: decoded {len(frames)} frames for "
+                               f"[{from_ts:.2f}, {to_ts:.2f}) in {path}, meta says {length}")
+        return ep, np.stack(frames)
+
+    with av.open(str(path)) as c:
+        s = c.streams.video[0]
+        s.thread_type = "AUTO"
+        tb = float(s.time_base)
+        for run in runs:
+            c.seek(int(max(run[0][1] - tol, 0.0) / tb), stream=s, backward=True, any_frame=False)
+            todo, i, frames = run, 0, []
+            for fr in c.decode(s):
+                if fr.pts is None:
+                    continue
+                t = fr.pts * tb
+                while t >= todo[i][2] - tol:          # past the end of episode i
+                    yield emit(todo[i], frames)
+                    frames, i = [], i + 1
+                    if i == len(todo):
+                        break
+                if i == len(todo):
+                    break
+                if t >= todo[i][1] - tol:
+                    frames.append(fr.to_ndarray(format="rgb24"))
+            else:                                     # file ended inside episode i
+                yield emit(todo[i], frames)
+                i += 1
+            if i != len(todo):
+                raise RuntimeError(f"{path} ended with {len(todo) - i} planned episodes undecoded")
+
+
+def _episode_task_index(root):
+    """episode_index -> task_index straight from the data parquets (a meta table's
+    data/file_index can be wrong — lerobot/libero's is — so read every file)."""
+    import pyarrow.parquet as pq
+
+    out = {}
+    for f in sorted(Path(root).glob("data/*/*.parquet")):
+        tb = pq.read_table(f, columns=["episode_index", "task_index"]).to_pandas()
+        for e, ti in tb.drop_duplicates("episode_index").itertuples(index=False):
+            out.setdefault(int(e), int(ti))
+    return out
+
+
 def _load_episodes(repo_id, revision, shard=0, num_shards=1, workers=8,
                    root=None, video_backend=None, episodes=None,
                    keys=None):  # pragma: no cover (GPU/dataset)
-    """Yield full episodes from a lerobot dataset (LeRobotDataset 0.5.1) — ALL frames.
-
-    Per-frame `ds[i]` access random-seeks into the episode videos and decodes one
-    frame at a time — the actual bottleneck of a full-frame build. Frames are
-    therefore streamed through a DataLoader with `workers` parallel decoders
-    (order-preserving), and sliced back into episodes here.
+    """Yield full episodes from a lerobot dataset (LeRobotDataset 0.5.1) — ALL frames
+    of the first camera, decoded file by file (see _FileStream).
 
     `root` reads a LOCAL dataset (the merged libero_all build) instead of the hub,
     `episodes` restricts the build to those episode_index values, and `keys` stamps
-    each episode with the task_key its records carry."""
-    from collections import deque
-
-    from torch.utils.data import DataLoader, Subset
+    each episode with the task_key its records carry. Shards own whole video files,
+    balanced by planned frame count, so no file is decoded twice."""
+    from torch.utils.data import DataLoader
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -243,12 +319,16 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1, workers=8,
                         video_backend=video_backend)
     img_key = ds.meta.camera_keys[0]
     eps = ds.meta.episodes
+    fps = float(ds.meta.fps)
+    text_of = {int(ti): str(name) for name, ti in
+               zip(ds.meta.tasks.index, ds.meta.tasks["task_index"])}
+    task_of = _episode_task_index(ds.meta.root)
 
     def _erow(i):
         return eps.iloc[i].to_dict() if hasattr(eps, "iloc") else eps[i]
 
     want = None if episodes is None else {int(e) for e in episodes}
-    all_eps, plan, acc = [], [], 0
+    by_file, n_planned = {}, 0
     for ep in range(ds.meta.total_episodes):
         row = _erow(ep)
         # `--episodes` and `--keys` address rows by episode_index; a meta table whose
@@ -257,84 +337,57 @@ def _load_episodes(repo_id, revision, shard=0, num_shards=1, workers=8,
             raise ValueError(f"meta/episodes row {ep} carries episode_index "
                              f"{int(row['episode_index'])}: rows are not addressed "
                              f"by episode_index in this dataset")
-        if row.get("dataset_from_index") is not None:
-            start = int(row["dataset_from_index"])
-            length = int(row["dataset_to_index"]) - start
-        else:
-            start, length = acc, int(row["length"])
-            acc += length
         if want is not None and ep not in want:
             continue
         if keys is not None and ep not in keys:
             raise KeyError(f"episode {ep} is missing from the episode_keys file; "
                            f"rebuild it for this dataset (scripts/make_episode_keys.py)")
-        all_eps.append((ep, start, length))
-    if want is not None and len(all_eps) != len(want):
-        missing = sorted(want - {e for e, _, _ in all_eps})
+        path = Path(ds.meta.root) / ds.meta.video_path.format(
+            video_key=img_key, chunk_index=int(row[f"videos/{img_key}/chunk_index"]),
+            file_index=int(row[f"videos/{img_key}/file_index"]))
+        span = (ep, float(row[f"videos/{img_key}/from_timestamp"]),
+                float(row[f"videos/{img_key}/to_timestamp"]), int(row["length"]))
+        by_file.setdefault(path, []).append(span)
+        n_planned += 1
+    if want is not None and n_planned != len(want):
+        have = {s[0] for spans in by_file.values() for s in spans}
+        missing = sorted(want - have)
         raise ValueError(f"{len(missing)} requested episodes are not in the dataset "
                          f"(first: {missing[:5]})")
-    if not all_eps:
+    if not by_file:
         raise ValueError(f"nothing to encode: {ds.meta.total_episodes} episodes in "
                          f"{repo_id}, 0 selected by --episodes")
 
-    # Balance shards by FRAME COUNT, not by episode count: LIBERO episodes run
-    # 75..505 frames, so round-robin `ep % num_shards` leaves one H100 grinding
-    # while the others idle. Longest-processing-time-first greedy assignment gets
-    # every shard within ~one episode of the mean.
-    if num_shards > 1:
-        load = [0] * num_shards
-        owner = {}
-        for ep, _, length in sorted(all_eps, key=lambda e: -e[2]):
-            s = min(range(num_shards), key=lambda i: load[i])
-            owner[ep], load[s] = s, load[s] + length
-        plan = [e for e in all_eps if owner[e[0]] == shard]
-        if not plan:
-            # An empty shard means the id is out of range (e.g. --shard 2 --num_shards
-            # 2: valid ids are 0..num_shards-1) — say so instead of dying later with
-            # a bare IndexError from the episode deque.
-            raise ValueError(
-                f"shard {shard} owns 0 episodes: num_shards={num_shards} assigns to "
-                f"shards 0..{num_shards - 1} (loads {load}). If you meant one shard "
-                f"per GPU, pass BOTH the gpu index in CUDA_VISIBLE_DEVICES and the "
-                f"shard index in 0..{num_shards - 1}.")
-        print(f"[shard {shard}] {len(plan)} episodes, {sum(e[2] for e in plan)} frames "
-              f"(shard loads: {load})", flush=True)
-    else:
-        plan = all_eps
+    # Shards own whole FILES (a file is decoded once, by one process); files are
+    # dealt longest-first to the least loaded shard, so shard wall times stay close.
+    files = sorted(by_file.items(), key=lambda kv: -sum(s[3] for s in kv[1]))
+    load, mine = [0] * num_shards, []
+    for path, spans in files:
+        s_ = min(range(num_shards), key=lambda i: load[i])
+        load[s_] += sum(sp[3] for sp in spans)
+        if s_ == shard:
+            mine.append((path, spans))
+    if not mine:
+        raise ValueError(f"shard {shard} owns 0 files: {len(files)} video files over "
+                         f"num_shards={num_shards} (loads {load}); use fewer shards")
+    plan_n = sum(len(sp) for _, sp in mine)
+    print(f"[shard {shard}] {len(mine)} files, {plan_n} episodes, {load[shard]} frames "
+          f"(shard loads: {load})", flush=True)
 
-    idxs = [i for _, start, length in plan for i in range(start, start + length)]
-    # Decode is the build's bottleneck (per-frame random access into the episode
-    # videos), so keep many workers busy and a deep prefetch queue: the encoder must
-    # never wait on a decoder. persistent_workers avoids re-forking per epoch.
-    loader = DataLoader(Subset(ds, idxs), batch_size=256, shuffle=False,
-                        num_workers=workers, pin_memory=True,
-                        prefetch_factor=(4 if workers else None),
-                        persistent_workers=bool(workers))
-
-    pending = deque(plan)
-    cur_ep, _, cur_need = pending.popleft()
-    cur_frames, cur_meta, done = [], None, 0
-    for batch in loader:
-        imgs = batch[img_key]
-        tasks = batch.get("task")
-        tis = batch["task_index"]
-        for j in range(imgs.shape[0]):
-            if cur_meta is None:
-                cur_meta = (tasks[j] if tasks is not None else "", int(tis[j]))
-            cur_frames.append(imgs[j])
-            if len(cur_frames) == cur_need:
-                done += 1
-                if done % 20 == 0 or done == len(plan):
-                    print(f"[shard {shard}] decoded {done}/{len(plan)} episodes",
-                          flush=True)
-                yield {"frames": torch.stack(cur_frames), "instruction": cur_meta[0],
-                       "episode": cur_ep, "task_index": cur_meta[1],
-                       "task_key": None if keys is None else keys[cur_ep]}
-                cur_frames, cur_meta = [], None
-                if pending:
-                    cur_ep, _, cur_need = pending.popleft()
-    if cur_frames or pending:
-        raise RuntimeError(f"decode stream ended early: {len(pending)} episodes left")
+    loader = DataLoader(_FileStream(mine, fps), batch_size=None,
+                        num_workers=min(workers, len(mine)),
+                        prefetch_factor=(2 if workers else None))
+    done = 0
+    for ep, frames in loader:
+        done += 1
+        if done % 20 == 0 or done == plan_n:
+            print(f"[shard {shard}] decoded {done}/{plan_n} episodes", flush=True)
+        ti = task_of[int(ep)]
+        yield {"frames": torch.as_tensor(frames).permute(0, 3, 1, 2).float().div_(255.0),
+               "instruction": text_of.get(ti, ""), "episode": int(ep), "task_index": ti,
+               "task_key": None if keys is None else keys[int(ep)]}
+    if done != plan_n:
+        raise RuntimeError(f"decode stream ended early: {done}/{plan_n} episodes")
 
 
 def main(argv=None):  # pragma: no cover (GPU)

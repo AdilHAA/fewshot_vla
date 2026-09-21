@@ -19,10 +19,9 @@
 #                   check (40 train tasks = 4 chunks of 10) on four cards:
 #             GPUS="0 1 2 3" ASSIGN="libero_90_train|0;libero_90_train|1;libero_90_train|2;libero_90_train|3" \
 #                 bash scripts/eval_all_8gpu.sh ours=<ckpt>
-#           The full HN-stage matrix (13 units + 4 train chunks = 17) on four cards
-#           (L90_CHUNKS applies to both pseudo-suites of a row; train has chunks 0-3):
-#             GPUS="0 1 2 3" ASSIGN="libero_10 libero_10_lan libero_90_eval libero_90_train|0;libero_10_object libero_10_swap libero_90_eval libero_90_train|1;libero_10_task libero_goal libero_90_eval libero_90_train|2;libero_object libero_spatial libero_90_eval libero_90_train|3 4" \
-#                 bash scripts/eval_all_8gpu.sh trunk=<ckpt>
+#           With exactly 4 GPUs and no ASSIGN, the HN-stage matrix is the default:
+#           13 units + the 4 libero_90_train chunks (17), e.g.
+#             GPUS="0 1 2 3" OUT_ROOT=outputs/eval_hn bash scripts/eval_all_8gpu.sh scratch=<ckpt>
 #           PER_TASK (libero_90_eval)  suite whose per-task table the summary prints
 
 set -euo pipefail
@@ -43,6 +42,15 @@ if [ -n "${ASSIGN:-}" ]; then
     # rows separated by ';' OR newlines (a pasted multi-line value must not lose rows);
     # blank rows and surrounding whitespace are dropped.
     mapfile -t ASSIGN < <(tr ';' '\n' <<< "$ASSIGN" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+elif [ "${#GPUS[@]}" -eq 4 ]; then
+    # HN-stage matrix on four cards: 13 units + the 4 libero_90_train chunks (the
+    # "HN does no harm" control). L90_CHUNKS applies to both pseudo-suites of a row.
+    ASSIGN=(
+        "libero_10 libero_10_lan libero_90_eval libero_90_train|0"
+        "libero_10_object libero_10_swap libero_90_eval libero_90_train|1"
+        "libero_10_task libero_goal libero_90_eval libero_90_train|2"
+        "libero_object libero_spatial libero_90_eval libero_90_train|3 4"
+    )
 else
     ASSIGN=(
         "libero_90_eval libero_10|0"

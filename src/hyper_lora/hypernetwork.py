@@ -37,6 +37,7 @@ class HyperNetwork(nn.Module):
         use_dino: bool = False,
         dino_dim: int = 0,
         zero_init_up: bool = True,
+        lora_norm: bool = False,
     ):
         super().__init__()
         if target_modules is None:
@@ -87,6 +88,17 @@ class HyperNetwork(nn.Module):
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
+        # lora_norm: LayerNorm the per-layer context and scale the decoded factors
+        # like a standard LoRA — W_down ~ 1/sqrt(in_features) (LoRA's A init),
+        # W_up ~ 1/sqrt(hidden) — so the adapter starts, and steps, at adapter
+        # scale. Without it the raw head outputs (rms ~1/sqrt(3) per entry, from an
+        # un-normalised residual stream) gave |dW| 100-7000x the frozen expert MLP
+        # weights on hn_scratch: the base was overwritten, not adapted. Off by
+        # default: every earlier checkpoint keeps its parametrisation.
+        self.lora_norm = lora_norm
+        if lora_norm:
+            self.ctx_norm = nn.LayerNorm(hidden_size)
+
         self.heads_up = nn.ModuleDict()
         self.heads_down = nn.ModuleDict()
         for mod, (in_f, out_f) in target_modules.items():
@@ -133,13 +145,18 @@ class HyperNetwork(nn.Module):
         return streams
 
     def _emit_lora(self, layer_ctx, B):
-        """layer_ctx: (B, num_layers, hidden) -> per-(mod, layer) LoRA pair."""
+        """layer_ctx: (B, num_layers, hidden) -> per-(mod, layer) (W_down, W_up) pair."""
         lora_weights = {mod: {} for mod in self.target_modules}
+        if self.lora_norm:
+            layer_ctx = self.ctx_norm(layer_ctx)
         for layer_idx in range(self.num_layers):
             ctx = layer_ctx[:, layer_idx, :]
             for mod, (in_f, out_f) in self.target_modules.items():
                 w_d = self.heads_down[mod](ctx).view(B, self.lora_rank, in_f)
                 w_u = self.heads_up[mod](ctx).view(B, out_f, self.lora_rank)
+                if self.lora_norm:
+                    w_d = w_d / in_f ** 0.5
+                    w_u = w_u / self.hidden_size ** 0.5
                 lora_weights[mod][layer_idx] = (w_d, w_u)
         return lora_weights
 

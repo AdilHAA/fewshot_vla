@@ -115,6 +115,11 @@
 #                                     expert_mlp = adapter on the ACTION EXPERT's
 #                                     gate/up/down, base fully frozen (EXPERT=0
 #                                     enforced) — the held-out stage's site.
+#   LNORM      (0)                    1 = --policy.hn_lora_norm=true: generated LoRA
+#                                     scaled like a standard LoRA (LayerNorm on the
+#                                     HN context, W_down/sqrt(in), W_up/sqrt(hidden)).
+#                                     Without it the adapter grew to |dW| >> |W| on
+#                                     the frozen expert (hn_scratch, 2026-09-21).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -170,6 +175,7 @@ DATASET="${DATASET:-lerobot/libero}"
 DATASET_ROOT="${DATASET_ROOT:-}"
 VIDEO_BACKEND="${VIDEO_BACKEND:-}"
 LORA_TARGET="${LORA_TARGET:-vlm_mlp}"
+LNORM="${LNORM:-0}"
 # --- overfit / training-extension knobs (direction 6) ---------------------------
 # EPISODES: train on ONLY these dataset episodes (single-task overfit). Format is a
 # python list, e.g. EPISODES="[57,58,59]"; empty = whole dataset (the old behaviour,
@@ -463,6 +469,7 @@ esac
 if [ "$MODE" != "lora" ]; then
     [ "$BASE" != "HuggingFaceVLA/smolvla_libero" ] && MODE_ARGS+=(--policy.base_smolvla_path="$BASE")
     [ "$LORA_TARGET" != "vlm_mlp" ] && MODE_ARGS+=(--policy.hn_lora_target="$LORA_TARGET")
+    [ "$LNORM" = "1" ] && MODE_ARGS+=(--policy.hn_lora_norm=true)
 fi
 
 echo "==> Train | mode=$MODE | rank=$RANK | prec=$PREC | batch=$BATCH/proc x $NPROC | seed=$SEED | aug=$AUG_FLAG | expert=$EXPERT_FLAG | wandb=$WANDB_FLAG"

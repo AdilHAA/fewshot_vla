@@ -49,6 +49,10 @@ class HyperLoRASmolVLAConfig(SmolVLAConfig):
     # and the policy starts identical to the frozen base (LoRA B=0 convention).
     # False reproduces the legacy behavior (random ΔW injected at init).
     hn_zero_init_up: bool = True
+    # Scale the generated LoRA like a standard LoRA (LayerNorm on the HN context,
+    # W_down/sqrt(in_features), W_up/sqrt(hn_hidden_size)). Off = the legacy raw
+    # head outputs, which on a frozen expert grew to |dW| >> |W| (hn_scratch).
+    hn_lora_norm: bool = False
 
     # --- Vision-conditioning for the hypernetwork --------------------------------
     # Off by default => the hypernetwork is conditioned on text only. Toggle these

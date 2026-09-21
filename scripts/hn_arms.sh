@@ -18,6 +18,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 ARM="${ARM:?set ARM=trunk|scratch}"
 export MODE=traj PAIR=cross K=1 VLM=0 EXPERT=0 LORA_TARGET=expert_mlp
+export LNORM="${LNORM:-1}"     # standard-LoRA scaling of the generated adapter (hn_scratch post-mortem)
 export RANK="${RANK:-16}" ALPHA="${ALPHA:-32}"
 export BASE="${BASE:-Kesvill/smolvla_libero_90}"
 export DATASET=local/libero_all DATASET_ROOT=outputs/libero90/libero_all VIDEO_BACKEND=pyav
@@ -37,5 +38,5 @@ case "$ARM" in
     *) echo "ERROR: ARM must be trunk|scratch, got '$ARM'" >&2; exit 1 ;;
 esac
 
-echo "==> HN arm=$ARM | base=$BASE | cache=$XPAIR_CACHE | rank/alpha=$RANK/$ALPHA | nproc=$NPROC x batch=$BATCH | steps=$STEPS | output=$OUTPUT"
+echo "==> HN arm=$ARM | base=$BASE | cache=$XPAIR_CACHE | rank/alpha=$RANK/$ALPHA | lnorm=$LNORM | nproc=$NPROC x batch=$BATCH | steps=$STEPS | output=$OUTPUT"
 exec bash scripts/train.sh

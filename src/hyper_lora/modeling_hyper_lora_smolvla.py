@@ -69,6 +69,7 @@ class HyperLoRASmolVLAPolicy(SmolVLAPolicy):
             use_dino=config.hn_use_dino,
             dino_dim=dino_dim,
             zero_init_up=config.hn_zero_init_up,
+            lora_norm=getattr(config, "hn_lora_norm", False),
         )
         self._freeze_base()
 

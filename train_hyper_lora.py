@@ -74,6 +74,46 @@ def _inject_base_config_overrides() -> None:
         sys.argv += extra
 
 
+def _patch_pin_base_stats() -> None:
+    """A frozen base keeps ITS OWN normalizer. lerobot_train builds the normalizer
+    from the training dataset's stats no matter what (even with pretrained_path it
+    overrides the loaded processors with dataset.meta.stats). For our policy types
+    with a `base_smolvla_path` that means the frozen base is fed states normalised
+    with another dataset's mean/std and its actions are un-normalised with them:
+    on hn_scratch the base's loss on its own episodes went 0.05 -> 0.37 from the
+    merged libero_all stats alone. Replace the STATE/ACTION (all non-VISUAL) feature
+    stats with the base checkpoint's before the processors are built; train saves
+    them with the checkpoint, so eval inherits the pinned stats. HN_PIN_BASE_STATS=0
+    restores the stock behaviour."""
+    if os.environ.get("HN_PIN_BASE_STATS", "1") == "0":
+        return
+    import lerobot.scripts.lerobot_train as _lt
+    from lerobot.configs.types import FeatureType
+
+    from src.hyper_lora.base_stats import load_base_normalizer_stats, pin_base_stats
+
+    orig = _lt.make_pre_post_processors
+
+    def patched(policy_cfg, pretrained_path=None, **kwargs):
+        base = getattr(policy_cfg, "base_smolvla_path", None)
+        if policy_cfg.type in ("hyper_lora_smolvla", "traj_hyper_lora_smolvla") and base:
+            keys = [k for k, ft in {**policy_cfg.input_features, **policy_cfg.output_features}.items()
+                    if ft.type != FeatureType.VISUAL]
+            base_stats = load_base_normalizer_stats(str(base))
+            if kwargs.get("dataset_stats") is not None:
+                kwargs["dataset_stats"], pinned = pin_base_stats(kwargs["dataset_stats"], base_stats, keys)
+                print(f"[train] normalizer stats pinned to base {base!r}: {pinned}")
+            for name, step in (("preprocessor_overrides", "normalizer_processor"),
+                               ("postprocessor_overrides", "unnormalizer_processor")):
+                ov = (kwargs.get(name) or {}).get(step)
+                if ov and ov.get("stats") is not None:
+                    ov["stats"], _ = pin_base_stats(ov["stats"], base_stats,
+                                                    [k for k in keys if k in ov["stats"]])
+        return orig(policy_cfg, pretrained_path=pretrained_path, **kwargs)
+
+    _lt.make_pre_post_processors = patched
+
+
 def _patch_deterministic_episode_filters() -> None:
     """lerobot 0.5.1 feeds `--dataset.episodes` into Dataset.from_parquet as a
     pyarrow Expression. On some pyarrow/datasets combos the Expression does not
@@ -203,6 +243,7 @@ def _patch_fast_index_mapping() -> None:
 if __name__ == "__main__":
     _enable_stack_dump_on_usr1()
     _inject_base_config_overrides()
+    _patch_pin_base_stats()
     _patch_deterministic_episode_filters()
     _patch_fast_index_mapping()
     _patch_ddp_timeout()

@@ -114,6 +114,22 @@ def _patch_pin_base_stats() -> None:
     _lt.make_pre_post_processors = patched
 
 
+def _patch_decoder_threads() -> None:
+    """Single-threaded per-sample video decode (env HN_DECODER_THREADS, default 1;
+    0 = stock). torchvision's pyav VideoReader `av.open`s the video for EVERY
+    sample and libdav1d then builds a pool of `nproc` threads (224 on SR006, in a
+    48-core cgroup quota): the first frame after a seek took ~0.1 s instead of
+    ~0.02 s and the DataLoader workers capped training at 1.5 step/s. Frames are
+    byte-identical. Must run before the DataLoader forks its workers (it does:
+    patches are applied before main())."""
+    from src.traj_data.decoder_threads import limit_decoder_threads
+
+    n = int(os.environ.get("HN_DECODER_THREADS", "1"))
+    limit_decoder_threads(n)
+    if n > 0:
+        print(f"[train] video decoder threads per open: {n}")
+
+
 def _patch_deterministic_episode_filters() -> None:
     """lerobot 0.5.1 feeds `--dataset.episodes` into Dataset.from_parquet as a
     pyarrow Expression. On some pyarrow/datasets combos the Expression does not
@@ -244,6 +260,7 @@ if __name__ == "__main__":
     _enable_stack_dump_on_usr1()
     _inject_base_config_overrides()
     _patch_pin_base_stats()
+    _patch_decoder_threads()
     _patch_deterministic_episode_filters()
     _patch_fast_index_mapping()
     _patch_ddp_timeout()

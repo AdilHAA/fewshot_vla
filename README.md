@@ -63,6 +63,7 @@ src/libero_pro/            LIBERO-Pro поверх родного LIBERO (сью
 src/data/libero.py         обход бага file_index в lerobot/libero
 
 scripts/
+  converter/                 no-op фильтрация LIBERO и временная шкала 10 FPS (HDF5 / LeRobot v3)
   setup.sh                   бутстрап окружения с нуля (PYTHON_VERSION=3.12)
   train.sh / eval.sh         единые точки запуска HN/LoRA/эвала; все ручки — env-переменными,
                              документированы в шапках самих скриптов
@@ -100,6 +101,9 @@ source venv/bin/activate
 
 
 ## Подготовка данных (нужна только для traj-режима и vision-абляций)
+
+Для фильтрации no-op и согласования FPS используйте
+[конвертер LIBERO](scripts/converter/README.md). Там описаны команды запуска и контракт данных для загрузчика.
 
 Датасет `lerobot/libero` скачивается автоматически. Сырые данные надо вручную скачивать только для генерации аугментаций:
 
